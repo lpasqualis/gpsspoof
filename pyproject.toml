@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iphone-spoof"
+version = "0.1.0"
+description = "Spoof GPS location on a USB-connected iPhone (iOS 17+) via pymobiledevice3"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lorenzo Pasqualis" }]
+dependencies = [
+    "pymobiledevice3>=4.10",
+]
+
+[project.scripts]
+gpsspoof = "iphone_spoof:main"
+
+[tool.setuptools]
+py-modules = ["iphone_spoof"]
