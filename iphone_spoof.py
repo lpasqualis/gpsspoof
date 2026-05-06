@@ -1,6 +1,45 @@
-"""iphone-spoof: spoof GPS on a USB-connected iPhone (iOS 17+) via pymobiledevice3.
+"""gpsspoof: spoof GPS on a USB-connected iPhone (iOS 17+) via pymobiledevice3.
 
-CLI entry point: `spoof` (defined in pyproject.toml). Targets pymobiledevice3 9.x.
+CLI entry point: `gpsspoof` (defined in pyproject.toml). Targets pymobiledevice3 9.x.
+
+Architecture
+------------
+The chain from the command line to "blue dot moves in Apple Maps" is::
+
+    usbmux.list_devices()                     # find iPhones over USB
+        │
+        ├─ lockdown.create_using_usbmux()     # query model + iOS version (no root)
+        │
+        └─ get_core_device_tunnel_services()  # pause `remoted`, Bonjour-scan for
+            │                                   the CoreDevice tunnel service
+            │                                   (NEEDS ROOT on macOS)
+            │
+            └─ start_tunnel_over_core_device(protocol=TCP)
+                │                              # bring up TCP tunnel; iOS 18.2+
+                │                              # removed QUIC, TCP works on all
+                │                              # iOS 17+ versions
+                │
+                └─ RemoteServiceDiscoveryService((host, port))
+                    │
+                    └─ DvtProvider(rsd)        # DVT channel for instruments
+                        │
+                        └─ LocationSimulation(dvt)
+                                │
+                                ├─ .set(lat, lon)   # simulateLocationWithLat...
+                                └─ .clear()         # stopLocationSimulation
+
+Two distinct privilege boundaries:
+
+* `list`, `status`, `add`, `rm` only read/write the local JSON config and
+  query usbmuxd. They run unprivileged.
+* `set` and `clear` need root because the tunnel setup pauses `remoted`
+  and creates a TCP tunnel to the device's RemoteXPC services.
+
+The active spoof session is mirrored to `~/.config/iphone-spoof/state.json`
+purely so `gpsspoof status` can describe what's running. The state file is
+removed on clean exit; if the `set` process is killed with `kill -9`, the
+file goes stale and the device may keep the simulated fix until the next
+`gpsspoof clear`.
 """
 
 from __future__ import annotations
@@ -41,8 +80,12 @@ DEFAULT_LOCATIONS = {
 
 
 def get_config_dir() -> Path:
-    # Under sudo, prefer the invoking user's home so the same locations.json
-    # is read whether or not sudo is in front of the command.
+    """Return ~/.config/iphone-spoof, resolving to the invoking user under sudo.
+
+    Without this fallback, `sudo gpsspoof set …` would resolve `~` to
+    `/root/.config/...` and read a different (likely empty) locations file
+    than `gpsspoof list` does.
+    """
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and hasattr(os, "geteuid") and os.geteuid() == 0:
         import pwd
@@ -101,7 +144,13 @@ def read_state() -> Optional[dict]:
 
 
 async def list_iphones() -> list[dict]:
-    """Return one entry per USB-connected iPhone (deduped on UDID)."""
+    """Return one entry per USB-connected iPhone (deduped on UDID).
+
+    usbmuxd reports a device once per active connection type — a single
+    iPhone can show up twice (USB + Network) when Wi-Fi sync is enabled.
+    We restrict to USB and dedupe on serial so each physical device
+    appears exactly once.
+    """
     from pymobiledevice3.lockdown import create_using_usbmux
     from pymobiledevice3.usbmux import list_devices
 
@@ -158,8 +207,17 @@ async def select_iphone(udid: Optional[str]) -> dict:
 async def open_rsd(udid: str):
     """Yield a connected RemoteServiceDiscoveryService for the given iPhone.
 
-    iOS 17+ exposes developer services over RemoteXPC. Bringing the tunnel
-    up creates a `utun` interface, which on macOS requires root.
+    iOS 17+ exposes developer services over RemoteXPC instead of plain
+    lockdown. Reaching them requires three privileged steps on macOS:
+
+    1. SIGSTOP `remoted` so it doesn't intercept the Bonjour responses
+       advertising the on-device CoreDevice tunnel service.
+    2. Open a TCP tunnel to that service. (iOS 18.2+ dropped QUIC; TCP
+       works for all iOS 17+ versions and is the default here.)
+    3. Connect to the resulting (host, port) via the RSD client.
+
+    Steps 1 and 2 each error out as `AccessDeniedError` / `EPERM` when
+    run without root; both are caught and re-routed to `_need_root()`.
     """
     from pymobiledevice3.exceptions import (
         AccessDeniedError,

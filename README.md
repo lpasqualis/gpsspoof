@@ -2,61 +2,113 @@
 
 A small macOS CLI that spoofs the GPS location of a USB-connected iPhone
 using [`pymobiledevice3`](https://github.com/doronz88/pymobiledevice3).
-Targets iOS 17 and newer (verified on iOS 26). Pure Python, no GUI.
-
-## What it does
+Pure Python, no GUI. Targets iOS 17 and newer (verified on iOS 26).
 
 ```text
-gpsspoof list                     # show known locations
-sudo gpsspoof set seattle         # start spoofing (stays in foreground; Ctrl-C to stop)
-sudo gpsspoof clear               # clear any active spoof on the phone
-gpsspoof status                   # show current state
-gpsspoof add airport 47.4502 -122.3088
-gpsspoof rm airport
-gpsspoof                          # no args == print help
+$ sudo gpsspoof set seattle
+connected: My iPhone (iPhone18,2) iOS 26.4.2
+udid:      00008030-0123456789ABCDEF
+... scanning for RemoteXPC service (Bonjour, ~3s)...
+... found RemoteXPC service in 3.1s
+... establishing TCP tunnel...
+... tunnel up at fd00:6:1:2:3:4:5:6:54321 (0.4s)
+... connecting to RemoteServiceDiscovery...
+... opening DVT channel...
+... DVT channel ready (1.2s)
+
+  SPOOFING ACTIVE  →  seattle  (47.6062, -122.3321)
+  device           →  My iPhone
+  pid              →  49823
+
+  press Ctrl-C to clear and exit
+
+^C
+... received stop signal after 47.3s, clearing location...
+... cleared. real GPS resumed.
 ```
 
-`set` keeps the process alive until you press Ctrl-C. On exit (clean,
-Ctrl-C, or exception) it issues a clear-location command so the real
-GPS resumes immediately.
+---
 
-## Why sudo?
+## Contents
 
-iOS 17+ moved the developer (DVT) services behind RemoteXPC. To talk
-to them, the tool has to:
+- [How it works](#how-it-works)
+- [Phone setup](#phone-setup)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Command reference](#command-reference)
+- [Locations file](#locations-file)
+- [State file](#state-file)
+- [Output, exit codes, and stderr/stdout split](#output-exit-codes-and-stderrstdout-split)
+- [Why does it need sudo?](#why-does-it-need-sudo)
+- [Troubleshooting](#troubleshooting)
+- [Comparison with the official `pymobiledevice3` CLI](#comparison-with-the-official-pymobiledevice3-cli)
+- [Multiple iPhones](#multiple-iphones)
+- [Limitations](#limitations)
+- [Requirements](#requirements)
 
-1. Pause the macOS `remoted` daemon so a Bonjour scan can find the
-   on-device tunnel service, and
-2. Bring up a TCP tunnel to the device.
+## How it works
 
-Both steps need root on macOS. `list`, `status`, `add`, and `rm` only
-read or write the local config file and run unprivileged. Only `set`
-and `clear` need `sudo`.
+```
+usbmux.list_devices()                   ─── find iPhones over USB
+        │
+        ├─ lockdown query                ─── model + iOS version (no root)
+        │
+        └─ get_core_device_tunnel_services()
+                │                        ─── pause `remoted`,
+                │                            Bonjour-scan for CoreDevice
+                │                            tunnel service  (NEEDS ROOT)
+                │
+                └─ start_tunnel_over_core_device(protocol=TCP)
+                        │                ─── bring up TCP tunnel
+                        │
+                        └─ RemoteServiceDiscoveryService
+                                │
+                                └─ DvtProvider
+                                        │
+                                        └─ LocationSimulation
+                                                .set(lat, lon)
+                                                .clear()
+```
 
-> Note: iOS 18.2+ removed QUIC tunnel support; the tool uses the TCP
-> tunnel which works on all iOS 17+ versions.
+`LocationSimulation.set` issues the same DVT instrument call Xcode uses
+(`simulateLocationWithLatitude:longitude:`). `.clear()` issues
+`stopLocationSimulation`, restoring the real GPS feed.
 
-## Phone setup (one-time)
+The tool uses **TCP** for the tunnel because iOS 18.2 removed QUIC
+support; TCP works for all iOS 17+ versions, so there's no version-gated
+branching.
 
-1. Plug the iPhone into the Mac with a data-capable USB cable and tap
-   "Trust This Computer" on the device.
-2. Enable Developer Mode on the phone:
+## Phone setup
+
+One-time, on the iPhone:
+
+1. Plug into the Mac with a **data**-capable USB cable (not a
+   power-only cable). Tap "Trust This Computer" on the device.
+2. Enable Developer Mode:
    `Settings → Privacy & Security → Developer Mode → On`. The phone
-   reboots and asks you to confirm Developer Mode after the reboot.
-3. Make sure the phone is unlocked when running `sudo gpsspoof set …`.
+   reboots and asks you to confirm Developer Mode after the reboot —
+   you have to confirm it again, otherwise the toggle reverts.
+3. Make sure the phone is **unlocked** when running `sudo gpsspoof
+   set …`. RemoteXPC services are only exposed while unlocked.
+
+The developer disk image (DDI) is bundled with iOS 17+ and mounts
+lazily on first developer-tool access. You don't usually need to mount
+it manually — but if `gpsspoof set` errors with "no RemoteXPC tunnel
+service found", that's the most likely cause.
 
 ## Install
 
-From the repo root:
-
 ```bash
+git clone https://github.com/lpasqualis/gpsspoof.git
+cd gpsspoof
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-That gives you `.venv/bin/gpsspoof`. To make plain `gpsspoof` and
-`sudo gpsspoof` both work without typing the venv path, drop two
-symlinks:
+The editable install puts a `gpsspoof` script at `.venv/bin/gpsspoof`.
+
+To make plain `gpsspoof` and `sudo gpsspoof` both work without
+typing the venv path, drop two symlinks:
 
 ```bash
 # user-writable, on your normal PATH
@@ -73,11 +125,126 @@ gpsspoof --help
 sudo gpsspoof --help
 ```
 
-## Default locations
+> Why two symlinks? `/opt/homebrew/bin` is on your interactive PATH but
+> isn't in macOS's compiled-in `secure_path`, so `sudo` won't find a
+> binary there. `/usr/local/bin` is in `secure_path` but isn't user
+> writable. One symlink in each gives you both ergonomics without
+> editing `sudoers`.
 
-The first `gpsspoof list` (or any other read of the config) creates
-`~/.config/iphone-spoof/locations.json` with these entries. Edit the
-file directly or use `gpsspoof add` / `gpsspoof rm` to change them.
+### Alternative: `pipx`
+
+If you prefer pipx, `pipx install .` works for the unprivileged
+commands but `sudo gpsspoof` still won't resolve unless you also
+symlink the pipx entry into `/usr/local/bin` as above.
+
+## Quick start
+
+```bash
+gpsspoof                          # no args ⇒ prints help
+
+gpsspoof list                     # list named locations
+sudo gpsspoof set seattle         # start spoofing; Ctrl-C to stop & clear
+gpsspoof status                   # show what's running (from any shell)
+sudo gpsspoof clear               # explicitly clear the device
+
+gpsspoof add airport 47.4502 -122.3088   # add or update a location
+gpsspoof rm airport                      # remove one
+```
+
+## Command reference
+
+### `gpsspoof list`
+
+Print all named locations from `~/.config/iphone-spoof/locations.json`,
+sorted alphabetically. Auto-creates the file on first run with 12
+default locations (see [Locations file](#locations-file)).
+
+```text
+  bellevue     47.6101,  -122.2015
+  issaquah     47.5301,  -122.0326
+  kent         47.3809,  -122.2348
+  ...
+```
+
+### `gpsspoof set NAME`
+
+Start spoofing the connected iPhone's GPS to the named location.
+**Requires root.** The process stays foregrounded until you press
+Ctrl-C; on exit (clean, Ctrl-C, or any exception) it sends a clear
+command so the real GPS feed resumes immediately.
+
+`NAME` must be a key from `locations.json` (case-sensitive).
+
+While it runs, `~/.config/iphone-spoof/state.json` records the active
+session so `gpsspoof status` from any other shell can describe it.
+
+```bash
+sudo gpsspoof set seattle
+sudo gpsspoof --udid 00008030-0123456789ABCDEF set tacoma
+```
+
+### `gpsspoof clear`
+
+Send a clear-location command to the device, restoring real GPS.
+**Requires root.** Useful when a previous `set` was killed without
+being able to clean up (e.g. `kill -9`, terminal closed without
+Ctrl-C, crash). Safe to run when nothing is spoofed.
+
+If `state.json` records a UDID, `clear` targets that device by default
+even if multiple iPhones are connected.
+
+### `gpsspoof status`
+
+Show the currently active spoof session, if any:
+
+```text
+spoofing:
+  device:   My iPhone [00008030-0123456789ABCDEF]
+  location: seattle (47.6062, -122.3321)
+  pid:      49823
+```
+
+If `state.json` exists but the recorded PID is gone, prints a "stale
+state" warning suggesting `sudo gpsspoof clear`. If neither, prints
+`no active spoof`.
+
+Runs unprivileged.
+
+### `gpsspoof add NAME LAT LON`
+
+Add or update a location. Latitude must be in `[-90, 90]`, longitude
+in `[-180, 180]`. Existing names are silently overwritten:
+
+```bash
+gpsspoof add liberty 40.6892 -74.0445
+```
+
+Prints `added` or `updated` so you can tell which happened.
+
+### `gpsspoof rm NAME`
+
+Remove a location. Errors if `NAME` isn't present.
+
+### `gpsspoof --udid UDID …`
+
+Disambiguate when multiple iPhones are plugged in. Applies to `set`,
+`clear`, and `status`. Without it, those commands refuse to guess and
+print all UDIDs.
+
+## Locations file
+
+Path: `~/.config/iphone-spoof/locations.json`
+
+Schema (a single JSON object whose keys are location names):
+
+```json
+{
+  "<name>": { "lat": <float>, "lon": <float> },
+  ...
+}
+```
+
+The first read auto-creates the file with these defaults:
 
 | name      | place               | lat       | lon         |
 |-----------|---------------------|----------:|------------:|
@@ -94,66 +261,222 @@ file directly or use `gpsspoof add` / `gpsspoof rm` to change them.
 | nyc       | New York, NY        |  40.7128  |  -74.0060   |
 | la        | Los Angeles, CA     |  34.0522  | -118.2437   |
 
-## Sample session
+You can hand-edit the file (it's just JSON) or use `gpsspoof add` /
+`gpsspoof rm`.
 
-```text
-$ sudo gpsspoof set seattle
-connected: My iPhone (iPhone18,2) iOS 26.4.2
-udid:      00008030-0123456789ABCDEF
-spoofing to seattle (47.6062, -122.3321)
-ctrl-c to stop
-^C
-clearing spoofed location...
+> Sudo and `~`: under `sudo`, `~` would normally resolve to `/root`.
+> `gpsspoof` reads `SUDO_USER`'s home instead, so the same
+> `locations.json` is used whether or not the command is prefixed
+> with `sudo`.
+
+## State file
+
+Path: `~/.config/iphone-spoof/state.json`
+
+Created by `gpsspoof set` on success, removed on clean exit. Contents:
+
+```json
+{
+  "udid": "00008030-0123456789ABCDEF",
+  "device_name": "My iPhone",
+  "name": "seattle",
+  "lat": 47.6062,
+  "lon": -122.3321,
+  "pid": 49823
+}
 ```
 
-Open Apple Maps on the phone — the blue dot reacts immediately. Some
-third-party apps cache location for a while; Maps is the cleanest way
-to confirm.
+Read-only as far as the tool is concerned — it's there so a separate
+`gpsspoof status` invocation (potentially from another shell) can
+describe the running session and check that the PID is alive.
+
+If `set` is killed in a way that prevents cleanup (`kill -9`, power
+loss, machine sleep), the file persists. `gpsspoof status` detects
+this with a `os.kill(pid, 0)` liveness check and shows a stale-state
+warning. The device may still hold the simulated fix in that case;
+`sudo gpsspoof clear` resets it.
+
+## Output, exit codes, and stderr/stdout split
+
+`gpsspoof` separates progress chatter from results:
+
+- **stdout** — durable output: list rows, status lines, the
+  `SPOOFING ACTIVE` block, `cleared 'X'`, `added 'X'`, etc.
+- **stderr** — transient stage updates: lines starting with `... `
+  (the Bonjour scan, tunnel timing, DVT handshake), the
+  auto-creation notice for `locations.json`, and warnings.
+
+Pipe-friendly:
+
+```bash
+gpsspoof list 2>/dev/null | awk '{print $1}'
+```
+
+Exit codes:
+
+| code | meaning                                              |
+|------|------------------------------------------------------|
+| 0    | success                                              |
+| 1    | most failures (printed to stderr via `sys.exit(msg)`) |
+| 2    | argparse usage error                                 |
+| 130  | interrupted (`Ctrl-C` during `set` / `clear`)        |
+
+## Why does it need sudo?
+
+iOS 17 redesigned the developer-tools protocol to use RemoteXPC. To
+reach those services from a Mac, two privileged things have to happen:
+
+1. **Pause `remoted`.** macOS's own `remoted` daemon would otherwise
+   intercept the Bonjour records advertising the on-device CoreDevice
+   tunnel service. `pymobiledevice3` sends `SIGSTOP` to it during the
+   scan and `SIGCONT` afterwards. Signaling system daemons requires
+   root.
+2. **Open the TCP tunnel.** The tunnel binds and connects in the
+   protected network namespace. (iOS 18.2+ removed QUIC; TCP is the
+   only protocol that still works.)
+
+Everything after the tunnel is up — the actual `set` / `clear` DVT
+calls — could in principle run unprivileged, but the same process
+holds the tunnel, so the whole `set` invocation runs as root.
+
+`list`, `status`, `add`, `rm` need none of this. They only touch
+`~/.config/iphone-spoof/` and (for `status`) usbmux info via
+usbmuxd's user socket.
+
+The state file and locations file are owned by your user (the tool
+explicitly resolves `SUDO_USER`'s home), so a `sudo gpsspoof set …`
+run leaves files you can read and edit afterwards without sudo.
+
+## Troubleshooting
+
+### `no iPhone connected over USB`
+
+- Unlock the phone.
+- Re-tap "Trust This Computer" if it's been a while.
+- Try a different cable. USB-A → Lightning power-only cables are
+  common and look identical to data cables. Same for some cheap USB-C
+  cables.
+- Check `system_profiler SPUSBDataType | grep -A 3 -i iphone` — if
+  macOS itself doesn't see the phone, no software fix will help.
+
+### `RemoteXPC tunnel setup needs root on macOS`
+
+Prefix the command with `sudo`. If you installed via the two-symlink
+recipe in [Install](#install), `sudo gpsspoof set seattle` works
+directly. Otherwise: `sudo $(which gpsspoof) set seattle`.
+
+### `no RemoteXPC tunnel service found`
+
+In rough order of likelihood:
+
+1. Developer Mode is off (`Settings → Privacy & Security → Developer
+   Mode`). Toggle on, reboot, **and** confirm again after the reboot.
+2. Phone is locked. Unlock and retry.
+3. Developer disk image hasn't mounted. Plug in, unlock, open Xcode
+   once (or run `pymobiledevice3 mounter auto-mount`), then retry.
+4. First scan after device reboot can take longer than the 3 s
+   Bonjour timeout — retry the command.
+
+### `sudo: gpsspoof: command not found`
+
+`sudo`'s `secure_path` excludes `/opt/homebrew/bin`. Either install
+the second symlink (see [Install](#install)) or run with
+`sudo $(which gpsspoof) …`.
+
+### `iOS 18.2+ removed QUIC protocol support`
+
+Shouldn't appear with this tool — we already use TCP. If you're
+seeing it, you're probably running the official `pymobiledevice3`
+command directly with default options; pass `--protocol tcp`.
+
+### Phone keeps the spoofed location after Ctrl-C
+
+The Ctrl-C path explicitly calls `LocationSimulation.clear()`. If you
+killed the process with `kill -9`, force-quit the terminal, or the
+machine slept, that cleanup didn't run. Fix:
+
+```bash
+sudo gpsspoof clear
+```
+
+### Stage line "scanning for RemoteXPC service" hangs > 30 s
+
+Bonjour scan is using a 3 s timeout. If you're stuck *much* longer,
+the next step (TCP tunnel) is the culprit. Try:
+
+```bash
+sudo /Users/you/path/to/.venv/bin/python -m pymobiledevice3 remote browse
+```
+
+If that hangs too, restart `remoted` (kill `remoted` with `sudo
+killall -9 remoted` and let launchd restart it) and retry. Often
+`remoted` ends up in a bad state after sleep/wake cycles.
+
+### Apple Maps blue dot didn't move
+
+- Confirm `gpsspoof set` actually printed `SPOOFING ACTIVE` (not just
+  the early stage lines).
+- Open Apple Maps (not Google Maps or third-party apps — many cache
+  location for several minutes). The dot should jump within a second.
+- If Maps still shows your real position, force-quit and reopen Maps.
+
+## Comparison with the official `pymobiledevice3` CLI
+
+`gpsspoof` is a thin wrapper for one specific workflow. The same
+underlying calls are exposed by the upstream CLI; here's the mapping
+in case you need to drop down a level:
+
+| `gpsspoof`                       | `pymobiledevice3` equivalent (with tunneld running)                 |
+|----------------------------------|--------------------------------------------------------------------|
+| `sudo gpsspoof set NAME`         | `pymobiledevice3 developer dvt simulate-location set --tunnel '' -- LAT LON` |
+| `sudo gpsspoof clear`            | `pymobiledevice3 developer dvt simulate-location clear --tunnel ''` |
+| (built-in tunnel setup)          | `sudo pymobiledevice3 remote tunneld` (separate, persistent)        |
+| (no equivalent — it's local)     | `pymobiledevice3 lockdown info`                                     |
+
+The big behavioral differences:
+
+- `gpsspoof set` brings up the tunnel itself per-invocation, so there
+  is **no** persistent `tunneld` daemon to manage.
+- Locations are looked up by name from a local JSON file; the upstream
+  CLI takes raw `lat lon` arguments.
+- `gpsspoof` registers signal handlers that explicitly clear on exit.
+
+If `gpsspoof` ever fails in a way that points at upstream tunneling,
+the upstream CLI is the lowest-friction fallback for diagnosing.
 
 ## Multiple iPhones
 
-If more than one iPhone is plugged in, `set` and `clear` refuse to
-guess and print all UDIDs. Pick one with `--udid`:
+Plug in two iPhones and run `gpsspoof set sf`:
+
+```text
+multiple iPhones connected; specify --udid:
+  00008030-0123456789ABCDEF  My iPhone  (iPhone18,2, iOS 26.4.2)
+  00008140-001234567890ABCD  Lab phone (iPhone16,1, iOS 18.4)
+```
+
+Pass `--udid` (top-level flag, before the subcommand):
 
 ```bash
 sudo gpsspoof --udid 00008030-0123456789ABCDEF set seattle
 ```
 
-## How it works
+Note: a single device often shows up twice in raw `usbmuxd` output —
+once over `USB`, once over `Network` (when Wi-Fi sync is on).
+`gpsspoof` filters to USB only and dedupes on UDID, so each physical
+device appears exactly once.
 
-1. `pymobiledevice3.usbmux.list_devices()` enumerates USB-connected
-   devices; lockdown reports model + iOS version.
-2. `get_core_device_tunnel_services(udid=…)` finds the on-device
-   RemoteXPC service via Bonjour (after pausing `remoted`).
-3. `start_tunnel_over_core_device(service, protocol=TCP)` brings up
-   the tunnel and returns a `(host, port)`.
-4. `RemoteServiceDiscoveryService((host, port))` connects to the RSD,
-   and `DvtProvider(rsd)` opens the DVT channel.
-5. `LocationSimulation(dvt).set(lat, lon)` issues the same DVT message
-   Xcode uses (`simulateLocationWithLatitude:longitude:`); `clear()`
-   sends `stopLocationSimulation`.
+## Limitations
 
-While `set` is running, `~/.config/iphone-spoof/state.json` records
-the active session so `gpsspoof status` can describe what's in flight.
-The state file is removed on clean exit.
-
-## Troubleshooting
-
-- **`no iPhone connected over USB`** — unlock the phone, re-tap Trust,
-  try a different cable (must be data-capable, not power-only).
-- **`RemoteXPC tunnel setup needs root on macOS`** — prefix the
-  command with `sudo`.
-- **`no RemoteXPC tunnel service found`** — Developer Mode probably
-  isn't on, or the phone is locked, or the developer disk image
-  isn't mounted yet (it ships with iOS 17+ but is mounted lazily).
-  Unlock the device and retry; the first run after reboot can take
-  a few extra seconds.
-- **`sudo: gpsspoof: command not found`** — sudo's `secure_path` does
-  not include `/opt/homebrew/bin`. Add the second symlink shown in
-  [Install](#install), or use `sudo $(which gpsspoof) set seattle`.
-- **`status` shows "stale state"** — a previous `set` was killed with
-  `kill -9` or crashed before clearing. The phone may still hold the
-  fix. Run `sudo gpsspoof clear` to reset it.
+- **macOS only.** The tunnel setup uses `utun` and `SIGSTOP` of
+  `remoted`, both Darwin-specific.
+- **One simulated point at a time.** No GPX route playback (the
+  underlying `LocationSimulation.play_gpx_file()` exists but isn't
+  exposed). Add a `play` subcommand if you need it.
+- **No altitude / speed / course.** Apple's DVT API only takes
+  lat/lon.
+- **Ctrl-C clear is best-effort.** If the device is already
+  disconnected when you Ctrl-C, the clear call fails and you'll see
+  `warning: clear failed: …`. Reconnect and run `sudo gpsspoof clear`.
 
 ## Requirements
 
@@ -161,3 +484,7 @@ The state file is removed on clean exit.
 - Python 3.10+
 - `pymobiledevice3 >= 9.0`
 - iPhone running iOS 17 or newer with Developer Mode enabled
+
+## License
+
+MIT (see `pyproject.toml`).
