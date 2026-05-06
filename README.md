@@ -456,73 +456,45 @@ without elevating themselves.
 - Initial setup needs `sudo` once.
 - Tunneld occasionally needs a restart after long sleep/wake cycles.
 
-### Install (manual)
+### Install
 
-You need the path to the `pymobiledevice3` binary inside whatever
-environment has it installed (`which pymobiledevice3`, e.g.
-`/Users/you/path/to/.venv/bin/pymobiledevice3`).
-
-Write a launchd plist:
+Run the bundled script from the repo root. It auto-detects the
+`pymobiledevice3` binary (preferring `.venv/bin/`, falling back to
+`$PATH`), writes the launchd plist, and bootstraps the daemon:
 
 ```bash
-# 1. Find the binary
-PMD3=$(which pymobiledevice3)
-echo "$PMD3"   # sanity check
-
-# 2. Drop the plist into /Library/LaunchDaemons/
-sudo tee /Library/LaunchDaemons/com.gpsspoof.tunneld.plist >/dev/null <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.gpsspoof.tunneld</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$PMD3</string>
-        <string>remote</string>
-        <string>tunneld</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/gpsspoof-tunneld.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/gpsspoof-tunneld.log</string>
-</dict>
-</plist>
-EOF
-
-# 3. Permissions launchd insists on
-sudo chown root:wheel /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
-sudo chmod 644 /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
-
-# 4. Load it
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
+./scripts/install-tunneld.sh
 ```
 
-Verify it's listening:
+You'll be prompted for your password once (the script needs root to
+write into `/Library/LaunchDaemons/` and load the daemon). It's
+idempotent — re-running just replaces the existing installation.
 
-```bash
-nc -z 127.0.0.1 49151 && echo "tunneld is up"
-```
-
-Now plain `gpsspoof set seattle` (no `sudo`) should work. The first
-stage line will read:
+When it finishes, plain `gpsspoof set seattle` (no `sudo`) should
+work and the first stage line will read:
 
 ```
 ... borrowed tunnel from tunneld in 0.0s (no root needed in this process)
 ```
 
+The script accepts environment overrides if you need them:
+
+| var                  | default                                        |
+|----------------------|------------------------------------------------|
+| `GPSSPOOF_PMD3`      | auto-detected (`.venv/bin/` then `$PATH`)      |
+| `GPSSPOOF_LABEL`     | `com.gpsspoof.tunneld`                          |
+| `GPSSPOOF_PLIST_DIR` | `/Library/LaunchDaemons`                        |
+| `GPSSPOOF_LOG`       | `/var/log/<label>.log`                          |
+
 ### Uninstall
 
 ```bash
-sudo launchctl bootout system/com.gpsspoof.tunneld
-sudo rm /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
+./scripts/uninstall-tunneld.sh
 ```
 
-`gpsspoof` automatically falls back to the in-process tunnel after
-tunneld goes away, so removing it is non-destructive.
+Stops the daemon and removes the plist. Safe to run when nothing is
+installed. `gpsspoof` automatically falls back to the in-process
+tunnel after tunneld goes away, so removing it is non-destructive.
 
 ### Troubleshooting tunneld
 
