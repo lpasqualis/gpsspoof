@@ -552,6 +552,66 @@ async def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _wait_for_iphone(udid_filter: Optional[str]) -> dict:
+    """Block until exactly one (matching) iPhone is connected, then return it.
+
+    First poll is silent so an already-connected device returns instantly.
+    On miss, prints a 'waiting' banner and ticks an elapsed-time line in
+    place once a second. Exits with the standard multi-iPhone error if
+    more than one matches and the caller didn't disambiguate.
+    """
+    def _filter(devices: list[dict]) -> list[dict]:
+        return [d for d in devices if not udid_filter or d["udid"] == udid_filter]
+
+    def _multi_error(devices: list[dict]) -> None:
+        msg = ["multiple iPhones connected; specify --udid:"]
+        for d in devices:
+            msg.append(
+                f"  {d['udid']}  {d['device_name']}  "
+                f"({d['product_type']}, iOS {d['product_version']})"
+            )
+        sys.exit("\n".join(msg))
+
+    iphones = _filter(await list_iphones())
+    if len(iphones) == 1:
+        return iphones[0]
+    if len(iphones) > 1:
+        _multi_error(iphones)
+
+    # No iPhone yet — show waiting state and poll.
+    print()
+    label = f"udid={udid_filter}" if udid_filter else "any iPhone"
+    print(f"  {ANSI['yellow']}waiting for {label} to be connected over USB..."
+          f"{ANSI['reset']}")
+    print(f"  {ANSI['dim']}(plug the phone in and unlock; Ctrl-C to cancel)"
+          f"{ANSI['reset']}")
+
+    started = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(1)
+            elapsed = int(time.monotonic() - started)
+            sys.stdout.write(
+                f"\r  {ANSI['dim']}polling usbmuxd... "
+                f"{elapsed}s{ANSI['reset']}  "
+            )
+            sys.stdout.flush()
+
+            iphones = _filter(await list_iphones())
+            if len(iphones) == 1:
+                sys.stdout.write(ANSI["clr_line"])
+                sys.stdout.flush()
+                return iphones[0]
+            if len(iphones) > 1:
+                sys.stdout.write(ANSI["clr_line"])
+                sys.stdout.flush()
+                _multi_error(iphones)
+    finally:
+        # Ensure the spinner line is wiped on any exit path (Ctrl-C, etc.)
+        sys.stdout.write(ANSI["clr_line"])
+        sys.stdout.flush()
+
+
 async def _menu_prompt(locations: dict) -> Optional[str]:
     """Show numbered menu, return chosen location key or None to quit."""
     names = sorted(locations.keys())
@@ -722,13 +782,21 @@ async def cmd_ui(args: argparse.Namespace) -> int:
     if not locations:
         sys.exit("no locations defined; add one with `gpsspoof add NAME LAT LON`")
 
-    iphone = await select_iphone(args.udid)
-
     bar = "─" * 60
     print()
     print(bar)
     print(f"  {ANSI['bold']}gpsspoof{ANSI['reset']}  "
           f"{ANSI['dim']}interactive mode{ANSI['reset']}")
+    print(bar)
+
+    try:
+        iphone = await _wait_for_iphone(args.udid)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        print(f"{ANSI['dim']}bye.{ANSI['reset']}")
+        return 0
+
+    print(f"  {ANSI['green']}connected{ANSI['reset']}")
     print(f"  device:  {iphone['device_name']} "
           f"({iphone['product_type']}) iOS {iphone['product_version']}")
     print(f"  udid:    {iphone['udid']}")
