@@ -316,6 +316,7 @@ The first read auto-creates the file with these defaults:
 | portland  | Portland, OR        |  45.5152  | -122.6784   |
 | nyc       | New York, NY        |  40.7128  |  -74.0060   |
 | la        | Los Angeles, CA     |  34.0522  | -118.2437   |
+| lax       | LAX airport         |  33.9416  | -118.4085   |
 
 You can hand-edit the file (it's just JSON) or use `gpsspoof add` /
 `gpsspoof rm`.
