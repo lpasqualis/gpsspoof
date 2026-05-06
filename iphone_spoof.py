@@ -11,9 +11,15 @@ import json
 import os
 import signal
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+
+
+def _progress(msg: str) -> None:
+    """Print a stage line to stderr so it's visually distinct from results."""
+    print(f"... {msg}", file=sys.stderr, flush=True)
 
 
 DEFAULT_LOCATIONS = {
@@ -172,9 +178,11 @@ async def open_rsd(udid: str):
         sys.exit(
             "RemoteXPC tunnel setup needs root on macOS\n"
             "(it stops `remoted` for Bonjour discovery and creates a utun).\n"
-            "Re-run as: sudo -E spoof ..."
+            "Re-run as: sudo gpsspoof ..."
         )
 
+    _progress("scanning for RemoteXPC service (Bonjour, ~3s)...")
+    t0 = time.monotonic()
     try:
         services = await get_core_device_tunnel_services(udid=udid)
     except AccessDeniedError:
@@ -190,12 +198,17 @@ async def open_rsd(udid: str):
             "and the developer disk image is mounted (it ships with iOS 17+)."
         )
     service = next((s for s in services if s.rsd.udid == udid), services[0])
+    _progress(f"found RemoteXPC service in {time.monotonic() - t0:.1f}s")
 
     # iOS 18.2+ dropped QUIC; TCP works for both old and new, so use TCP.
     try:
+        _progress("establishing TCP tunnel...")
+        t1 = time.monotonic()
         async with start_tunnel_over_core_device(
             service, protocol=TunnelProtocol.TCP
         ) as tr:
+            _progress(f"tunnel up at {tr.address}:{tr.port} ({time.monotonic() - t1:.1f}s)")
+            _progress("connecting to RemoteServiceDiscovery...")
             async with RemoteServiceDiscoveryService((tr.address, tr.port)) as rsd:
                 yield rsd
     except AccessDeniedError:
@@ -214,7 +227,10 @@ async def open_dvt(udid: str):
     from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
 
     async with open_rsd(udid) as rsd:
+        _progress("opening DVT channel...")
+        t = time.monotonic()
         async with DvtProvider(rsd) as dvt:
+            _progress(f"DVT channel ready ({time.monotonic() - t:.1f}s)")
             yield dvt
 
 
@@ -315,6 +331,7 @@ async def cmd_set(args: argparse.Namespace) -> int:
     async with open_dvt(iphone["udid"]) as dvt:
         async with LocationSimulation(dvt) as sim:
             await sim.set(lat, lon)
+            started_at = time.monotonic()
             write_state({
                 "udid": iphone["udid"],
                 "device_name": iphone["device_name"],
@@ -323,8 +340,13 @@ async def cmd_set(args: argparse.Namespace) -> int:
                 "lon": lon,
                 "pid": os.getpid(),
             })
-            print(f"spoofing to {args.name} ({lat}, {lon})")
-            print("ctrl-c to stop")
+            print()
+            print(f"  SPOOFING ACTIVE  →  {args.name}  ({lat}, {lon})")
+            print(f"  device           →  {iphone['device_name']}")
+            print(f"  pid              →  {os.getpid()}")
+            print()
+            print("  press Ctrl-C to clear and exit")
+            print()
 
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -337,9 +359,11 @@ async def cmd_set(args: argparse.Namespace) -> int:
             try:
                 await stop.wait()
             finally:
-                print("\nclearing spoofed location...")
+                held = time.monotonic() - started_at
+                print(f"\n... received stop signal after {held:.1f}s, clearing location...")
                 try:
                     await sim.clear()
+                    print("... cleared. real GPS resumed.")
                 except Exception as e:
                     print(f"warning: clear failed: {e}", file=sys.stderr)
                 write_state(None)
