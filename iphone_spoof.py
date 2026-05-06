@@ -50,7 +50,9 @@ import json
 import os
 import signal
 import sys
+import termios
 import time
+import tty
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -59,6 +61,21 @@ from typing import Optional
 def _progress(msg: str) -> None:
     """Print a stage line to stderr so it's visually distinct from results."""
     print(f"... {msg}", file=sys.stderr, flush=True)
+
+
+# ANSI sequences for the interactive UI. Skipped automatically when stdout
+# is not a tty (e.g. piped output) so logs stay clean.
+_USE_ANSI = sys.stdout.isatty()
+_CSI = "\x1b["
+ANSI = {
+    "reset":  _CSI + "0m" if _USE_ANSI else "",
+    "bold":   _CSI + "1m" if _USE_ANSI else "",
+    "dim":    _CSI + "2m" if _USE_ANSI else "",
+    "green":  _CSI + "32m" if _USE_ANSI else "",
+    "yellow": _CSI + "33m" if _USE_ANSI else "",
+    "cyan":   _CSI + "36m" if _USE_ANSI else "",
+    "clr_line": _CSI + "2K\r" if _USE_ANSI else "\r",
+}
 
 
 DEFAULT_LOCATIONS = {
@@ -428,6 +445,210 @@ async def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _menu_prompt(locations: dict) -> Optional[str]:
+    """Show numbered menu, return chosen location key or None to quit."""
+    names = sorted(locations.keys())
+    name_w = max(len(n) for n in names)
+    while True:
+        print()
+        print(f"{ANSI['bold']}Select a location:{ANSI['reset']}")
+        for i, name in enumerate(names, 1):
+            loc = locations[name]
+            print(f"  {ANSI['dim']}[{i:2d}]{ANSI['reset']}  "
+                  f"{name:<{name_w}}  "
+                  f"{float(loc['lat']):>9.4f}, {float(loc['lon']):>10.4f}")
+        print(f"  {ANSI['dim']}[ q]{ANSI['reset']}  quit")
+        print()
+        try:
+            raw = await asyncio.get_event_loop().run_in_executor(
+                None, input, f"{ANSI['cyan']}>{ANSI['reset']} "
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        choice = raw.strip().lower()
+        if not choice or choice in ("q", "quit", "exit"):
+            return None
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(names):
+                return names[idx - 1]
+        if choice in locations:
+            return choice
+        print(f"  {ANSI['yellow']}'{raw.strip()}' is not a valid choice"
+              f"{ANSI['reset']}")
+
+
+async def _wait_for_key_with_ticker(started_at: float) -> str:
+    """Hold until the user presses a key; tick an elapsed-time line in place.
+
+    Returns 'quit' if the keypress was Ctrl-C (byte 0x03), else 'back'.
+    Falls back to a blocking input() when stdin is not a tty.
+    """
+    fd = sys.stdin.fileno()
+    is_tty = os.isatty(fd)
+    loop = asyncio.get_event_loop()
+
+    if not is_tty:
+        # Non-tty stdin: just wait for a line. No tick (no point).
+        try:
+            await loop.run_in_executor(None, sys.stdin.readline)
+        except KeyboardInterrupt:
+            return "quit"
+        return "back"
+
+    old_attrs = termios.tcgetattr(fd)
+    new_attrs = termios.tcgetattr(fd)
+    # cbreak + no echo + no signal generation: Ctrl-C arrives as byte 0x03
+    # so we can clean up before reacting, instead of having SIGINT cancel
+    # us mid-clear.
+    new_attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+    termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+
+    future: asyncio.Future = loop.create_future()
+
+    def on_readable() -> None:
+        try:
+            data = os.read(fd, 16)
+        except Exception:
+            data = b""
+        if not future.done():
+            future.set_result(data)
+
+    loop.add_reader(fd, on_readable)
+
+    async def ticker() -> None:
+        while True:
+            elapsed = int(time.monotonic() - started_at)
+            h, m, s = elapsed // 3600, (elapsed // 60) % 60, elapsed % 60
+            sys.stdout.write(
+                f"\r  {ANSI['dim']}elapsed:{ANSI['reset']} "
+                f"{h}:{m:02d}:{s:02d}  "
+            )
+            sys.stdout.flush()
+            await asyncio.sleep(1)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        data = await future
+        # Wipe the elapsed line so the cleanup messages start clean.
+        sys.stdout.write(ANSI["clr_line"])
+        sys.stdout.flush()
+        return "quit" if data and b"\x03" in data else "back"
+    finally:
+        ticker_task.cancel()
+        try:
+            await ticker_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            loop.remove_reader(fd)
+        except Exception:
+            pass
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+async def _interactive_session(
+    iphone: dict, name: str, loc: dict
+) -> bool:
+    """Open tunnel, set the location, hold until keypress, clear.
+
+    Returns True if the user wants to quit the whole UI (Ctrl-C),
+    False to return to the menu.
+    """
+    lat = float(loc["lat"])
+    lon = float(loc["lon"])
+
+    print()
+    print(f"{ANSI['bold']}→ engaging:{ANSI['reset']} {name} ({lat}, {lon})")
+
+    from pymobiledevice3.services.dvt.instruments.location_simulation import (
+        LocationSimulation,
+    )
+
+    quit_app = False
+    async with open_dvt(iphone["udid"]) as dvt:
+        async with LocationSimulation(dvt) as sim:
+            await sim.set(lat, lon)
+            started = time.monotonic()
+            write_state({
+                "udid": iphone["udid"],
+                "device_name": iphone["device_name"],
+                "name": name,
+                "lat": lat,
+                "lon": lon,
+                "pid": os.getpid(),
+            })
+
+            print()
+            print(f"  {ANSI['green']}{ANSI['bold']}┌─ SPOOFING ACTIVE"
+                  f"{ANSI['reset']}")
+            print(f"  {ANSI['green']}│{ANSI['reset']}  "
+                  f"{name}  ({lat}, {lon})")
+            print(f"  {ANSI['green']}│{ANSI['reset']}  "
+                  f"{iphone['device_name']}  [{iphone['udid']}]")
+            print(f"  {ANSI['green']}│{ANSI['reset']}")
+            print(f"  {ANSI['green']}└─{ANSI['reset']} "
+                  f"{ANSI['dim']}press any key to clear and return to menu  "
+                  f"(Ctrl-C to quit){ANSI['reset']}")
+
+            try:
+                result = await _wait_for_key_with_ticker(started)
+                quit_app = result == "quit"
+            finally:
+                print(f"  {ANSI['dim']}clearing...{ANSI['reset']}")
+                try:
+                    await sim.clear()
+                except Exception as e:
+                    print(f"  {ANSI['yellow']}warning: clear failed: "
+                          f"{e}{ANSI['reset']}")
+                write_state(None)
+                print(f"  {ANSI['green']}cleared, real GPS resumed"
+                      f"{ANSI['reset']}")
+    return quit_app
+
+
+async def cmd_ui(args: argparse.Namespace) -> int:
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        sys.exit(
+            "interactive UI needs root for the RemoteXPC tunnel.\n"
+            "Re-run as: sudo gpsspoof ui"
+        )
+
+    locations = load_locations()
+    if not locations:
+        sys.exit("no locations defined; add one with `gpsspoof add NAME LAT LON`")
+
+    iphone = await select_iphone(args.udid)
+
+    bar = "─" * 60
+    print()
+    print(bar)
+    print(f"  {ANSI['bold']}gpsspoof{ANSI['reset']}  "
+          f"{ANSI['dim']}interactive mode{ANSI['reset']}")
+    print(f"  device:  {iphone['device_name']} "
+          f"({iphone['product_type']}) iOS {iphone['product_version']}")
+    print(f"  udid:    {iphone['udid']}")
+    print(bar)
+
+    try:
+        while True:
+            choice = await _menu_prompt(locations)
+            if choice is None:
+                break
+            try:
+                if await _interactive_session(iphone, choice, locations[choice]):
+                    break  # Ctrl-C in active session → quit UI
+            except KeyboardInterrupt:
+                break
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    print()
+    print(f"{ANSI['dim']}bye.{ANSI['reset']}")
+    return 0
+
+
 async def cmd_clear(args: argparse.Namespace) -> int:
     state = read_state()
     udid = args.udid or (state.get("udid") if state else None)
@@ -460,6 +681,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Common usage:\n"
+            "  sudo gpsspoof ui                  # interactive menu (recommended)\n"
             "  gpsspoof list                     # show known locations\n"
             "  sudo gpsspoof set seattle         # start spoofing (Ctrl-C to stop)\n"
             "  sudo gpsspoof clear               # stop any active spoof\n"
@@ -467,7 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  gpsspoof add airport 47.4502 -122.3088\n"
             "  gpsspoof rm airport\n"
             "\n"
-            "Note: `set` and `clear` need root on macOS for the RemoteXPC tunnel."
+            "Note: `ui`, `set`, and `clear` need root on macOS for the RemoteXPC tunnel."
         ),
     )
     p.add_argument(
@@ -476,6 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
+    sub.add_parser("ui", help="interactive menu mode (needs sudo)")
     sub.add_parser("list", help="list available named locations")
 
     p_set = sub.add_parser("set", help="start spoofing to a named location (needs sudo)")
@@ -518,6 +741,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "clear":
         try:
             return asyncio.run(cmd_clear(args))
+        except KeyboardInterrupt:
+            return 130
+    if args.cmd == "ui":
+        try:
+            return asyncio.run(cmd_ui(args))
         except KeyboardInterrupt:
             return 130
     return 2

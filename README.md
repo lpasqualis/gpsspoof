@@ -36,6 +36,13 @@ udid:      00008030-0123456789ABCDEF
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Command reference](#command-reference)
+  - [`sudo gpsspoof ui`](#sudo-gpsspoof-ui)
+  - [`gpsspoof list`](#gpsspoof-list)
+  - [`gpsspoof set`](#gpsspoof-set-name)
+  - [`gpsspoof clear`](#gpsspoof-clear)
+  - [`gpsspoof status`](#gpsspoof-status)
+  - [`gpsspoof add`](#gpsspoof-add-name-lat-lon)
+  - [`gpsspoof rm`](#gpsspoof-rm-name)
 - [Locations file](#locations-file)
 - [State file](#state-file)
 - [Output, exit codes, and stderr/stdout split](#output-exit-codes-and-stderrstdout-split)
@@ -140,10 +147,11 @@ symlink the pipx entry into `/usr/local/bin` as above.
 ## Quick start
 
 ```bash
-gpsspoof                          # no args ⇒ prints help
+sudo gpsspoof ui                  # interactive menu (recommended)
 
+gpsspoof                          # no args ⇒ prints help
 gpsspoof list                     # list named locations
-sudo gpsspoof set seattle         # start spoofing; Ctrl-C to stop & clear
+sudo gpsspoof set seattle         # one-shot foreground spoof; Ctrl-C clears
 gpsspoof status                   # show what's running (from any shell)
 sudo gpsspoof clear               # explicitly clear the device
 
@@ -152,6 +160,54 @@ gpsspoof rm airport                      # remove one
 ```
 
 ## Command reference
+
+### `sudo gpsspoof ui`
+
+Interactive mode. **Requires root.** Pick a location from a numbered
+menu, watch the tunnel come up, see a live elapsed-time counter while
+the device is being spoofed, then press any key to clear and pick a
+different location. `q` (or empty input) at the menu exits cleanly;
+Ctrl-C at any point clears the device and quits the whole UI.
+
+```text
+────────────────────────────────────────────────────────────
+  gpsspoof  interactive mode
+  device:  My iPhone (iPhone18,2) iOS 26.4.2
+  udid:    00008030-0123456789ABCDEF
+────────────────────────────────────────────────────────────
+
+Select a location:
+  [ 1]  bellevue   47.6101, -122.2015
+  [ 2]  issaquah   47.5301, -122.0326
+  [ 3]  kent       47.3809, -122.2348
+  ...
+  [12]  vegas      36.1699, -115.1398
+  [ q]  quit
+
+> 1
+→ engaging: bellevue (47.6101, -122.2015)
+... scanning for RemoteXPC service (Bonjour, ~3s)...
+... tunnel up at fd00:6:1:2:3:4:5:6:54321 (0.4s)
+... DVT channel ready (1.2s)
+
+  ┌─ SPOOFING ACTIVE
+  │  bellevue  (47.6101, -122.2015)
+  │  My iPhone  [00008030-0123456789ABCDEF]
+  │
+  └─ press any key to clear and return to menu  (Ctrl-C to quit)
+  elapsed: 0:00:42
+[user presses space]
+  clearing...
+  cleared, real GPS resumed
+
+Select a location:
+...
+```
+
+`ui` is the simplest way to flip between locations rapidly: each
+selection re-establishes the tunnel, sets the location, and tears it
+down on key press. The tunnel/DVT setup runs once per selection, so
+expect the same 5–20 s warm-up each time.
 
 ### `gpsspoof list`
 
