@@ -36,7 +36,7 @@ udid:      00008030-0123456789ABCDEF
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Command reference](#command-reference)
-  - [`sudo gpsspoof ui`](#sudo-gpsspoof-ui)
+  - [`gpsspoof ui`](#gpsspoof-ui)
   - [`gpsspoof list`](#gpsspoof-list)
   - [`gpsspoof set`](#gpsspoof-set-name)
   - [`gpsspoof clear`](#gpsspoof-clear)
@@ -47,6 +47,7 @@ udid:      00008030-0123456789ABCDEF
 - [State file](#state-file)
 - [Output, exit codes, and stderr/stdout split](#output-exit-codes-and-stderrstdout-split)
 - [Why does it need sudo?](#why-does-it-need-sudo)
+- [Skip sudo with tunneld](#skip-sudo-with-tunneld)
 - [Troubleshooting](#troubleshooting)
 - [Comparison with the official `pymobiledevice3` CLI](#comparison-with-the-official-pymobiledevice3-cli)
 - [Multiple iPhones](#multiple-iphones)
@@ -147,23 +148,28 @@ symlink the pipx entry into `/usr/local/bin` as above.
 ## Quick start
 
 ```bash
-sudo gpsspoof ui                  # interactive menu (recommended)
+gpsspoof ui                       # interactive menu (recommended)
 
 gpsspoof                          # no args ⇒ prints help
 gpsspoof list                     # list named locations
-sudo gpsspoof set seattle         # one-shot foreground spoof; Ctrl-C clears
+gpsspoof set seattle              # one-shot foreground spoof; Ctrl-C clears
 gpsspoof status                   # show what's running (from any shell)
-sudo gpsspoof clear               # explicitly clear the device
+gpsspoof clear                    # explicitly clear the device
 
 gpsspoof add airport 47.4502 -122.3088   # add or update a location
 gpsspoof rm airport                      # remove one
 ```
 
+> `ui`, `set`, `clear` need either `sudo` **or** a running tunneld
+> daemon (set up once — see [Skip sudo with tunneld](#skip-sudo-with-tunneld)).
+> The tool auto-detects tunneld; if it isn't running, prefix the
+> command with `sudo`.
+
 ## Command reference
 
-### `sudo gpsspoof ui`
+### `gpsspoof ui`
 
-Interactive mode. **Requires root.** Pick a location from a numbered
+Interactive mode. **Needs root or a running tunneld.** Pick a location from a numbered
 menu, watch the tunnel come up, see a live elapsed-time counter while
 the device is being spoofed, then press any key to clear and pick a
 different location. `q` (or empty input) at the menu exits cleanly;
@@ -225,7 +231,7 @@ default locations (see [Locations file](#locations-file)).
 ### `gpsspoof set NAME`
 
 Start spoofing the connected iPhone's GPS to the named location.
-**Requires root.** The process stays foregrounded until you press
+**Needs root or a running tunneld.** The process stays foregrounded until you press
 Ctrl-C; on exit (clean, Ctrl-C, or any exception) it sends a clear
 command so the real GPS feed resumes immediately.
 
@@ -242,7 +248,7 @@ sudo gpsspoof --udid 00008030-0123456789ABCDEF set tacoma
 ### `gpsspoof clear`
 
 Send a clear-location command to the device, restoring real GPS.
-**Requires root.** Useful when a previous `set` was killed without
+**Needs root or a running tunneld.** Useful when a previous `set` was killed without
 being able to clean up (e.g. `kill -9`, terminal closed without
 Ctrl-C, crash). Safe to run when nothing is spoofed.
 
@@ -405,16 +411,129 @@ reach those services from a Mac, two privileged things have to happen:
    only protocol that still works.)
 
 Everything after the tunnel is up — the actual `set` / `clear` DVT
-calls — could in principle run unprivileged, but the same process
-holds the tunnel, so the whole `set` invocation runs as root.
+calls — could in principle run unprivileged. There are two ways to
+satisfy steps 1 and 2:
 
-`list`, `status`, `add`, `rm` need none of this. They only touch
+- **`sudo gpsspoof …`** — `gpsspoof` does both steps itself. Simple,
+  no extra moving parts, but you `sudo` every time. (NOPASSWD sudoers
+  rule eliminates the password prompt — see the install section.)
+- **Run a `tunneld` daemon as root** — a long-lived process owns
+  the privilege, exposes a localhost API, and `gpsspoof` borrows a
+  ready-made tunnel from it without ever needing root itself. See
+  [Skip sudo with tunneld](#skip-sudo-with-tunneld).
+
+`gpsspoof` auto-detects tunneld at `127.0.0.1:49151` and prefers it
+when available, falling back to the in-process path otherwise. You
+can install tunneld at any time and the existing commands just start
+working without `sudo`.
+
+`list`, `status`, `add`, `rm` need none of this — they only touch
 `~/.config/iphone-spoof/` and (for `status`) usbmux info via
 usbmuxd's user socket.
 
 The state file and locations file are owned by your user (the tool
 explicitly resolves `SUDO_USER`'s home), so a `sudo gpsspoof set …`
 run leaves files you can read and edit afterwards without sudo.
+
+## Skip sudo with tunneld
+
+`pymobiledevice3` ships with a `tunneld` daemon that holds the
+privileged plumbing (the `remoted` pause + the TCP tunnel) and
+exposes a localhost HTTP API (`127.0.0.1:49151`). Once it's running,
+unprivileged clients — including `gpsspoof` — can borrow a tunnel
+without elevating themselves.
+
+### What you gain
+
+- `gpsspoof set seattle`, `gpsspoof clear`, `gpsspoof ui` all run
+  without `sudo`.
+- The tunnel is kept warm between calls, so the 5–20 s setup cost
+  collapses to ~0 s after the first connect.
+
+### What it costs
+
+- One always-running process (~25 MB resident, idle most of the time).
+- Initial setup needs `sudo` once.
+- Tunneld occasionally needs a restart after long sleep/wake cycles.
+
+### Install (manual)
+
+You need the path to the `pymobiledevice3` binary inside whatever
+environment has it installed (`which pymobiledevice3`, e.g.
+`/Users/you/path/to/.venv/bin/pymobiledevice3`).
+
+Write a launchd plist:
+
+```bash
+# 1. Find the binary
+PMD3=$(which pymobiledevice3)
+echo "$PMD3"   # sanity check
+
+# 2. Drop the plist into /Library/LaunchDaemons/
+sudo tee /Library/LaunchDaemons/com.gpsspoof.tunneld.plist >/dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gpsspoof.tunneld</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PMD3</string>
+        <string>remote</string>
+        <string>tunneld</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/gpsspoof-tunneld.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/gpsspoof-tunneld.log</string>
+</dict>
+</plist>
+EOF
+
+# 3. Permissions launchd insists on
+sudo chown root:wheel /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
+sudo chmod 644 /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
+
+# 4. Load it
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
+```
+
+Verify it's listening:
+
+```bash
+nc -z 127.0.0.1 49151 && echo "tunneld is up"
+```
+
+Now plain `gpsspoof set seattle` (no `sudo`) should work. The first
+stage line will read:
+
+```
+... borrowed tunnel from tunneld in 0.0s (no root needed in this process)
+```
+
+### Uninstall
+
+```bash
+sudo launchctl bootout system/com.gpsspoof.tunneld
+sudo rm /Library/LaunchDaemons/com.gpsspoof.tunneld.plist
+```
+
+`gpsspoof` automatically falls back to the in-process tunnel after
+tunneld goes away, so removing it is non-destructive.
+
+### Troubleshooting tunneld
+
+- **`gpsspoof` still says "needs root"** — tunneld isn't reachable.
+  Check `nc -z 127.0.0.1 49151`, then `tail /var/log/gpsspoof-tunneld.log`.
+- **tunneld is up but `gpsspoof` falls back to in-process** — tunneld
+  hasn't paired the device yet. Plug the phone in, unlock it, wait a
+  few seconds for tunneld to discover it.
+- **Stops working after wake from sleep** — known: `remoted`
+  occasionally lands in a stuck state. Restart tunneld:
+  `sudo launchctl kickstart -k system/com.gpsspoof.tunneld`.
 
 ## Troubleshooting
 

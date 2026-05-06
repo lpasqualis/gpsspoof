@@ -63,6 +63,44 @@ def _progress(msg: str) -> None:
     print(f"... {msg}", file=sys.stderr, flush=True)
 
 
+TUNNELD_HOST = "127.0.0.1"
+TUNNELD_PORT = 49151
+
+
+def _is_tunneld_running() -> bool:
+    """Return True if something is listening on the tunneld port.
+
+    This is a fast localhost probe (~ms). False positives only happen if
+    a different process is squatting on the port; the actual HTTP exchange
+    inside `_try_tunneld` would then fail and we'd fall back cleanly.
+    """
+    import socket
+    try:
+        with socket.create_connection((TUNNELD_HOST, TUNNELD_PORT), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _check_privileged_or_tunneld(action: str) -> None:
+    """Bail out early when the action can't possibly succeed.
+
+    `set` / `clear` / `ui` need either root (to build the tunnel
+    in-process) or a running tunneld daemon (to borrow one). If neither
+    is available, fail fast with a helpful message instead of letting
+    the device-side code fail mid-flow.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return  # root: we can build the tunnel ourselves
+    if _is_tunneld_running():
+        return  # tunneld will broker the tunnel for us
+    sys.exit(
+        f"`gpsspoof {action}` needs either:\n"
+        f"  - root: re-run as `sudo gpsspoof {action}`, or\n"
+        f"  - a running tunneld daemon (see README: 'Skip sudo with tunneld')."
+    )
+
+
 # ANSI sequences for the interactive UI. Skipped automatically when stdout
 # is not a tty (e.g. piped output) so logs stay clean.
 _USE_ANSI = sys.stdout.isatty()
@@ -226,9 +264,46 @@ async def select_iphone(udid: Optional[str]) -> dict:
     return iphones[0]
 
 
+async def _try_tunneld(udid: str):
+    """Return a connected RSD from a running tunneld, or None if unavailable.
+
+    Reasons we return None (and the caller falls back to the in-process
+    tunnel):
+      * tunneld isn't running at all — `TunneldConnectionError`,
+      * tunneld is running but doesn't have this UDID paired,
+      * the cached tunnel info exists but the RSD connect itself fails.
+
+    The caller is responsible for `await rsd.close()` on the returned
+    RSD when done.
+    """
+    if not _is_tunneld_running():
+        return None
+    try:
+        from pymobiledevice3.tunneld.api import (
+            TunneldConnectionError,
+            get_tunneld_device_by_udid,
+        )
+    except ImportError:
+        return None
+
+    _progress(f"checking tunneld at {TUNNELD_HOST}:{TUNNELD_PORT}...")
+    t = time.monotonic()
+    try:
+        rsd = await get_tunneld_device_by_udid(udid)
+    except TunneldConnectionError:
+        _progress("tunneld unreachable; will try in-process tunnel")
+        return None
+    if rsd is None:
+        _progress("tunneld is running but doesn't see this UDID; will try in-process tunnel")
+        return None
+    _progress(f"borrowed tunnel from tunneld in {time.monotonic() - t:.1f}s "
+              f"(no root needed in this process)")
+    return rsd
+
+
 @asynccontextmanager
-async def open_rsd(udid: str):
-    """Yield a connected RemoteServiceDiscoveryService for the given iPhone.
+async def _open_rsd_in_process(udid: str):
+    """Build a tunnel in this process and yield a connected RSD.
 
     iOS 17+ exposes developer services over RemoteXPC instead of plain
     lockdown. Reaching them requires three privileged steps on macOS:
@@ -259,7 +334,9 @@ async def open_rsd(udid: str):
         sys.exit(
             "RemoteXPC tunnel setup needs root on macOS\n"
             "(it stops `remoted` for Bonjour discovery and creates a utun).\n"
-            "Re-run as: sudo gpsspoof ..."
+            "Re-run as: sudo gpsspoof ...\n"
+            "Or install the tunneld daemon to skip sudo "
+            "(see README: 'Skip sudo with tunneld')."
         )
 
     _progress("scanning for RemoteXPC service (Bonjour, ~3s)...")
@@ -281,7 +358,6 @@ async def open_rsd(udid: str):
     service = next((s for s in services if s.rsd.udid == udid), services[0])
     _progress(f"found RemoteXPC service in {time.monotonic() - t0:.1f}s")
 
-    # iOS 18.2+ dropped QUIC; TCP works for both old and new, so use TCP.
     try:
         _progress("establishing TCP tunnel...")
         t1 = time.monotonic()
@@ -300,6 +376,30 @@ async def open_rsd(udid: str):
         raise
     except NoDeviceConnectedError:
         sys.exit("device disconnected before tunnel could come up")
+
+
+@asynccontextmanager
+async def open_rsd(udid: str):
+    """Yield a connected RemoteServiceDiscoveryService for the given iPhone.
+
+    Tries tunneld (no root needed) first; falls back to building the
+    tunnel in-process (root required). The fallback chain means the
+    same code works whether or not the user has installed tunneld as
+    a launchd daemon.
+    """
+    rsd = await _try_tunneld(udid)
+    if rsd is not None:
+        try:
+            yield rsd
+        finally:
+            try:
+                await rsd.close()
+            except Exception:
+                pass
+        return
+
+    async with _open_rsd_in_process(udid) as rsd:
+        yield rsd
 
 
 @asynccontextmanager
@@ -388,6 +488,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 
 async def cmd_set(args: argparse.Namespace) -> int:
+    _check_privileged_or_tunneld("set")
     locations = load_locations()
     if args.name not in locations:
         sys.exit(
@@ -615,11 +716,7 @@ async def _interactive_session(
 
 
 async def cmd_ui(args: argparse.Namespace) -> int:
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        sys.exit(
-            "interactive UI needs root for the RemoteXPC tunnel.\n"
-            "Re-run as: sudo gpsspoof ui"
-        )
+    _check_privileged_or_tunneld("ui")
 
     locations = load_locations()
     if not locations:
@@ -656,6 +753,7 @@ async def cmd_ui(args: argparse.Namespace) -> int:
 
 
 async def cmd_clear(args: argparse.Namespace) -> int:
+    _check_privileged_or_tunneld("clear")
     state = read_state()
     udid = args.udid or (state.get("udid") if state else None)
     iphone = await select_iphone(udid)
@@ -687,15 +785,16 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Common usage:\n"
-            "  sudo gpsspoof ui                  # interactive menu (recommended)\n"
+            "  gpsspoof ui                       # interactive menu (recommended)\n"
             "  gpsspoof list                     # show known locations\n"
-            "  sudo gpsspoof set seattle         # start spoofing (Ctrl-C to stop)\n"
-            "  sudo gpsspoof clear               # stop any active spoof\n"
+            "  gpsspoof set seattle              # start spoofing (Ctrl-C to stop)\n"
+            "  gpsspoof clear                    # stop any active spoof\n"
             "  gpsspoof status                   # show current state\n"
             "  gpsspoof add airport 47.4502 -122.3088\n"
             "  gpsspoof rm airport\n"
             "\n"
-            "Note: `ui`, `set`, and `clear` need root on macOS for the RemoteXPC tunnel."
+            "Note: `ui`, `set`, `clear` need either root (`sudo gpsspoof ...`)\n"
+            "or a running tunneld daemon. See README: 'Skip sudo with tunneld'."
         ),
     )
     p.add_argument(
@@ -704,13 +803,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
-    sub.add_parser("ui", help="interactive menu mode (needs sudo)")
+    sub.add_parser("ui", help="interactive menu mode (needs sudo or tunneld)")
     sub.add_parser("list", help="list available named locations")
 
-    p_set = sub.add_parser("set", help="start spoofing to a named location (needs sudo)")
+    p_set = sub.add_parser("set", help="start spoofing to a named location (needs sudo or tunneld)")
     p_set.add_argument("name", help="name from locations.json")
 
-    sub.add_parser("clear", help="stop any active spoof on the device (needs sudo)")
+    sub.add_parser("clear", help="stop any active spoof on the device (needs sudo or tunneld)")
     sub.add_parser("status", help="show current spoofed location, if any")
 
     p_add = sub.add_parser("add", help="add or update a named location")
