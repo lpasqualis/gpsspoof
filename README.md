@@ -302,21 +302,33 @@ Schema (a single JSON object whose keys are location names):
 
 The first read auto-creates the file with these defaults:
 
+I-5 corridor, **south → north** (Portland OR up to Bellingham WA):
+
+| name        | place               | lat       | lon         |
+|-------------|---------------------|----------:|------------:|
+| portland    | Portland, OR        |  45.5152  | -122.6784   |
+| vancouver   | Vancouver, WA       |  45.6387  | -122.6615   |
+| olympia     | Olympia, WA         |  47.0379  | -122.9007   |
+| tacoma      | Tacoma, WA          |  47.2529  | -122.4443   |
+| federal-way | Federal Way, WA     |  47.3223  | -122.3126   |
+| kent        | Kent, WA            |  47.3809  | -122.2348   |
+| renton      | Renton, WA          |  47.4829  | -122.2171   |
+| issaquah    | Issaquah, WA        |  47.5301  | -122.0326   |
+| seattle     | Seattle, WA         |  47.6062  | -122.3321   |
+| bellevue    | Bellevue, WA        |  47.6101  | -122.2015   |
+| redmond     | Redmond, WA         |  47.6740  | -122.1215   |
+| everett     | Everett, WA         |  47.9790  | -122.2021   |
+| marysville  | Marysville, WA      |  48.0517  | -122.1771   |
+| bellingham  | Bellingham, WA      |  48.7519  | -122.4787   |
+
+Other US:
+
 | name      | place               | lat       | lon         |
 |-----------|---------------------|----------:|------------:|
-| seattle   | Seattle, WA         |  47.6062  | -122.3321   |
-| renton    | Renton, WA          |  47.4829  | -122.2171   |
-| kent      | Kent, WA            |  47.3809  | -122.2348   |
-| issaquah  | Issaquah, WA        |  47.5301  | -122.0326   |
-| bellevue  | Bellevue, WA        |  47.6101  | -122.2015   |
-| redmond   | Redmond, WA         |  47.6740  | -122.1215   |
-| olympia   | Olympia, WA         |  47.0379  | -122.9007   |
-| tacoma    | Tacoma, WA          |  47.2529  | -122.4443   |
 | vegas     | Las Vegas, NV       |  36.1699  | -115.1398   |
-| portland  | Portland, OR        |  45.5152  | -122.6784   |
-| nyc       | New York, NY        |  40.7128  |  -74.0060   |
 | la        | Los Angeles, CA     |  34.0522  | -118.2437   |
 | lax       | LAX airport         |  33.9416  | -118.4085   |
+| nyc       | New York, NY        |  40.7128  |  -74.0060   |
 
 You can hand-edit the file (it's just JSON) or use `gpsspoof add` /
 `gpsspoof rm`.

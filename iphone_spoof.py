@@ -79,21 +79,26 @@ ANSI = {
 
 
 DEFAULT_LOCATIONS = {
-    # Washington
-    "seattle":   {"lat": 47.6062, "lon": -122.3321},
-    "renton":    {"lat": 47.4829, "lon": -122.2171},
-    "kent":      {"lat": 47.3809, "lon": -122.2348},
-    "issaquah":  {"lat": 47.5301, "lon": -122.0326},
-    "bellevue":  {"lat": 47.6101, "lon": -122.2015},
-    "redmond":   {"lat": 47.6740, "lon": -122.1215},
-    "olympia":   {"lat": 47.0379, "lon": -122.9007},
-    "tacoma":    {"lat": 47.2529, "lon": -122.4443},
+    # I-5 corridor, Portland OR → Bellingham WA (south to north)
+    "portland":    {"lat": 45.5152, "lon": -122.6784},
+    "vancouver":   {"lat": 45.6387, "lon": -122.6615},  # Vancouver, WA
+    "olympia":     {"lat": 47.0379, "lon": -122.9007},
+    "tacoma":      {"lat": 47.2529, "lon": -122.4443},
+    "federal-way": {"lat": 47.3223, "lon": -122.3126},
+    "kent":        {"lat": 47.3809, "lon": -122.2348},
+    "renton":      {"lat": 47.4829, "lon": -122.2171},
+    "issaquah":    {"lat": 47.5301, "lon": -122.0326},
+    "seattle":     {"lat": 47.6062, "lon": -122.3321},
+    "bellevue":    {"lat": 47.6101, "lon": -122.2015},
+    "redmond":     {"lat": 47.6740, "lon": -122.1215},
+    "everett":     {"lat": 47.9790, "lon": -122.2021},
+    "marysville":  {"lat": 48.0517, "lon": -122.1771},
+    "bellingham":  {"lat": 48.7519, "lon": -122.4787},
     # Other US
-    "vegas":     {"lat": 36.1699, "lon": -115.1398},
-    "portland":  {"lat": 45.5152, "lon": -122.6784},
-    "nyc":       {"lat": 40.7128, "lon":  -74.0060},
-    "la":        {"lat": 34.0522, "lon": -118.2437},
-    "lax":       {"lat": 33.9416, "lon": -118.4085},
+    "vegas":       {"lat": 36.1699, "lon": -115.1398},
+    "la":          {"lat": 34.0522, "lon": -118.2437},
+    "lax":         {"lat": 33.9416, "lon": -118.4085},
+    "nyc":         {"lat": 40.7128, "lon":  -74.0060},
 }
 
 
