@@ -38,7 +38,8 @@ udid:      00008030-0123456789ABCDEF
 - [Command reference](#command-reference)
   - [`gpsspoof ui`](#gpsspoof-ui)
   - [`gpsspoof list`](#gpsspoof-list)
-  - [`gpsspoof set`](#gpsspoof-set-name)
+  - [`gpsspoof set`](#gpsspoof-set-location--lat-lon)
+  - [`gpsspoof route`](#gpsspoof-route-waypoints)
   - [`gpsspoof clear`](#gpsspoof-clear)
   - [`gpsspoof status`](#gpsspoof-status)
   - [`gpsspoof add`](#gpsspoof-add-name-lat-lon)
@@ -153,6 +154,8 @@ gpsspoof ui                       # interactive menu (recommended)
 gpsspoof                          # no args ⇒ prints help
 gpsspoof list                     # list named locations
 gpsspoof set seattle              # one-shot foreground spoof; Ctrl-C clears
+gpsspoof set 47.490308 -122.205647   # spoof to raw coordinates
+gpsspoof route kent seattle redmond --speed 30   # drive a route at 30 mph
 gpsspoof status                   # show what's running (from any shell)
 gpsspoof clear                    # explicitly clear the device
 
@@ -160,7 +163,7 @@ gpsspoof add airport 47.4502 -122.3088   # add or update a location
 gpsspoof rm airport                      # remove one
 ```
 
-> `ui`, `set`, `clear` need either `sudo` **or** a running tunneld
+> `ui`, `set`, `route`, `clear` need either `sudo` **or** a running tunneld
 > daemon (set up once — see [Skip sudo with tunneld](#skip-sudo-with-tunneld)).
 > The tool auto-detects tunneld; if it isn't running, prefix the
 > command with `sudo`.
@@ -189,6 +192,8 @@ Select a location:
   ...
   [12]  vegas      36.1699, -115.1398
   [ q]  quit
+  ...or a coordinate pair: 47.490308, -122.205647
+  ...or a route to drive: kent > seattle > redmond @ 30
 
 > 1
 → engaging: bellevue (47.6101, -122.2015)
@@ -215,6 +220,18 @@ selection re-establishes the tunnel, sets the location, and tears it
 down on key press. The tunnel/DVT setup runs once per selection, so
 expect the same 5–20 s warm-up each time.
 
+Besides the numbered entries, you can type at the `>` prompt:
+
+- a raw coordinate pair (e.g. `47.490308, -122.205647`) to spoof an
+  arbitrary point that isn't in the list; or
+- a route to drive — waypoints separated by `>` (or `->`) with an
+  optional trailing `@ speed` in mph, e.g.
+  `kent > seattle > redmond @ 30` or
+  `47.5,-122.2 > 47.49,-122.2 @ 25`. Each waypoint may be a name or a
+  `lat,lon` pair. The route plays once and then waits at the final
+  waypoint for a keypress (Ctrl-C while it's still moving quits the UI).
+  See [`gpsspoof route`](#gpsspoof-route-waypoints) for the full command.
+
 ### `gpsspoof list`
 
 Print all named locations from `~/.config/iphone-spoof/locations.json`,
@@ -228,22 +245,82 @@ default locations (see [Locations file](#locations-file)).
   ...
 ```
 
-### `gpsspoof set NAME`
+### `gpsspoof set LOCATION | LAT LON`
 
-Start spoofing the connected iPhone's GPS to the named location.
+Start spoofing the connected iPhone's GPS to a location.
 **Needs root or a running tunneld.** The process stays foregrounded until you press
 Ctrl-C; on exit (clean, Ctrl-C, or any exception) it sends a clear
 command so the real GPS feed resumes immediately.
 
-`NAME` must be a key from `locations.json` (case-sensitive).
+The target is either a name from `locations.json` (case-sensitive) **or**
+a raw coordinate pair. Coordinates may be given as two arguments or as a
+single comma-separated string, so you can paste straight from Apple Maps
+or Google Maps. Latitude must be in `[-90, 90]`, longitude in
+`[-180, 180]`:
+
+```bash
+sudo gpsspoof set seattle                       # named location
+sudo gpsspoof set 47.490308 -122.205647         # two arguments
+sudo gpsspoof set "47.490308, -122.205647"      # one pasted string
+sudo gpsspoof --udid 00008030-0123456789ABCDEF set tacoma
+```
+
+When you pass coordinates, the coordinate string itself is used as the
+display name in `state.json` and `gpsspoof status` (nothing is added to
+`locations.json` — use `gpsspoof add` for that).
 
 While it runs, `~/.config/iphone-spoof/state.json` records the active
 session so `gpsspoof status` from any other shell can describe it.
 
+### `gpsspoof route WAYPOINTS`
+
+Simulate **movement**: travel in straight-line segments through two or
+more waypoints at a chosen speed, instead of standing at one point.
+**Needs root or a running tunneld.** The device's position is updated
+once a second, interpolated along the line between consecutive waypoints,
+so Apple Maps shows the blue dot gliding along the route.
+
+Each waypoint is either a name from `locations.json` or a single
+`lat,lon` token (one shell argument — comma-separate the pair, no space,
+or quote it). You can mix the two freely:
+
 ```bash
-sudo gpsspoof set seattle
-sudo gpsspoof --udid 00008030-0123456789ABCDEF set tacoma
+sudo gpsspoof route kent seattle redmond --speed 30
+sudo gpsspoof route 47.504993,-122.233256 47.491833,-122.233326 47.484829,-122.198335 --speed 30
+sudo gpsspoof route kent "47.49, -122.20" redmond --speed 25
 ```
+
+`--speed` is a bare number in **miles per hour** by default; add a unit
+suffix to change that (`30mph`, `48km/h`, `13m/s`). Default is 30 mph.
+
+By default the route runs once and then **holds at the final waypoint**
+until you press Ctrl-C (which clears and restores real GPS). Pass
+`--loop` to drive the route on repeat (start → end → start → …) until
+Ctrl-C:
+
+```bash
+sudo gpsspoof route kent seattle redmond --speed 45 --loop
+```
+
+```text
+  route:  kent -> seattle -> redmond
+  speed:  30.0 mph
+  length: 14.62 mi  (~1764s per pass)
+
+  press Ctrl-C to clear and exit
+
+  seg 2/2 -> redmond  47.64012, -122.17683   71.3%  30 mph  ETA 507s
+```
+
+Notes:
+
+- Movement is interpolated as a straight line between waypoints (a
+  rhumb-style path in lat/lon), not snapped to roads.
+- A waypoint token that *starts* with `-` (a southern- or
+  western-hemisphere point like `-33.8688,151.2093`) is otherwise
+  mistaken for an option flag; put `--` before the waypoint list:
+  `sudo gpsspoof route --speed 50 -- -33.8688,151.2093 -37.8136,144.9631`.
+- `gpsspoof status` reports the route as its `start -> ... -> end` label.
 
 ### `gpsspoof clear`
 
@@ -290,8 +367,8 @@ Remove a location. Errors if `NAME` isn't present.
 ### `gpsspoof --udid UDID …`
 
 Disambiguate when multiple iPhones are plugged in. Applies to `set`,
-`clear`, and `status`. Without it, those commands refuse to guess and
-print all UDIDs.
+`route`, `clear`, and `status`. Without it, those commands refuse to
+guess and print all UDIDs.
 
 ## Locations file
 

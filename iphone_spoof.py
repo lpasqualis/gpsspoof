@@ -47,7 +47,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
+import re
 import signal
 import sys
 import termios
@@ -65,6 +67,22 @@ def _progress(msg: str) -> None:
 
 TUNNELD_HOST = "127.0.0.1"
 TUNNELD_PORT = 49151
+
+# Speed handling for `route`. A bare number is interpreted as miles/hour.
+MPH_TO_MPS = 0.44704
+SPEED_UNITS = {
+    "mph": MPH_TO_MPS,
+    "kmh": 1000.0 / 3600.0,
+    "km/h": 1000.0 / 3600.0,
+    "kph": 1000.0 / 3600.0,
+    "mps": 1.0,
+    "m/s": 1.0,
+}
+DEFAULT_ROUTE_SPEED_MPH = 30.0
+# How often the simulated position is updated while driving a route. 1s keeps
+# the device-side call rate modest while staying smooth in Apple Maps (at
+# 30 mph that's a ~13 m step between updates).
+ROUTE_TICK_S = 1.0
 
 
 def _is_tunneld_running() -> bool:
@@ -202,6 +220,115 @@ def read_state() -> Optional[dict]:
         return json.loads(path.read_text())
     except json.JSONDecodeError:
         return None
+
+
+def parse_coords(text: str) -> Optional[tuple[float, float]]:
+    """Parse "lat, lon" (or "lat lon") into a validated (lat, lon) pair.
+
+    Returns None when the text isn't shaped like a coordinate pair, so the
+    caller can fall back to a named-location lookup. Raises ValueError with a
+    specific message when the text *is* a pair but a value is out of range —
+    that's a typo worth reporting, not a name to look up.
+
+    Accepts comma- and/or whitespace-separated forms so a pasted
+    "47.490308, -122.205647" works as-is.
+    """
+    parts = [p for p in text.replace(",", " ").split() if p]
+    if len(parts) != 2:
+        return None
+    try:
+        lat = float(parts[0])
+        lon = float(parts[1])
+    except ValueError:
+        return None
+    if not (-90.0 <= lat <= 90.0):
+        raise ValueError(f"latitude must be in [-90, 90], got {lat}")
+    if not (-180.0 <= lon <= 180.0):
+        raise ValueError(f"longitude must be in [-180, 180], got {lon}")
+    return (lat, lon)
+
+
+def parse_speed(text: str) -> float:
+    """Parse a speed string into meters/second.
+
+    A bare number ("30") is miles/hour. A unit suffix overrides that:
+    "48km/h", "13 m/s", "30mph". Raises ValueError on anything unparseable,
+    non-positive, or in an unknown unit.
+    """
+    s = text.strip().lower()
+    m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([a-z/]*)\s*", s)
+    if not m:
+        raise ValueError(f"could not parse speed: {text!r}")
+    value = float(m.group(1))
+    unit = m.group(2) or "mph"
+    if unit not in SPEED_UNITS:
+        raise ValueError(
+            f"unknown speed unit '{unit}' (use one of: mph, km/h, m/s)"
+        )
+    if value <= 0:
+        raise ValueError(f"speed must be positive, got {value}")
+    return value * SPEED_UNITS[unit]
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in meters."""
+    radius = 6371000.0  # mean Earth radius
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dlam / 2) ** 2)
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def resolve_waypoint(token: str, locations: dict) -> tuple[str, float, float]:
+    """Resolve one waypoint (a name or a "lat,lon" token) to (name, lat, lon).
+
+    Raises ValueError if the token is neither valid coordinates nor a known
+    location name.
+    """
+    token = token.strip()
+    coords = parse_coords(token)  # raises ValueError on out-of-range coords
+    if coords is not None:
+        lat, lon = coords
+        return (f"{lat}, {lon}", lat, lon)
+    if token in locations:
+        loc = locations[token]
+        return (token, float(loc["lat"]), float(loc["lon"]))
+    raise ValueError(
+        f"unknown waypoint '{token}' "
+        f"(not coordinates, and not a known location)"
+    )
+
+
+def resolve_waypoints(
+    tokens: list[str], locations: dict
+) -> list[tuple[str, float, float]]:
+    """Resolve a list of waypoint tokens, requiring at least two."""
+    points = [resolve_waypoint(t, locations) for t in tokens]
+    if len(points) < 2:
+        raise ValueError("a route needs at least two waypoints")
+    return points
+
+
+def parse_route_line(
+    line: str, locations: dict
+) -> tuple[list[tuple[str, float, float]], float]:
+    """Parse an interactive route line into (waypoints, speed_mps).
+
+    Format: ``WP > WP [> WP ...] [@ SPEED]`` where each WP is a name or a
+    "lat,lon" pair, waypoints are separated by ``>`` or ``->``, and the
+    optional trailing ``@ SPEED`` overrides the default speed (mph). e.g.::
+
+        kent > seattle > redmond @ 30
+        47.5,-122.2 -> 47.49,-122.2 @ 48km/h
+    """
+    speed_mps = DEFAULT_ROUTE_SPEED_MPH * MPH_TO_MPS
+    if "@" in line:
+        line, _, speed_str = line.rpartition("@")
+        speed_mps = parse_speed(speed_str)
+    tokens = [t.strip() for t in re.split(r"->|>", line) if t.strip()]
+    return resolve_waypoints(tokens, locations), speed_mps
 
 
 async def list_iphones() -> list[dict]:
@@ -415,6 +542,70 @@ async def open_dvt(udid: str):
             yield dvt
 
 
+def route_total_m(points: list[tuple[str, float, float]]) -> float:
+    """Sum of segment distances along a list of (name, lat, lon) waypoints."""
+    return sum(
+        haversine_m(points[i][1], points[i][2], points[i + 1][1], points[i + 1][2])
+        for i in range(len(points) - 1)
+    )
+
+
+def _print_route_progress(
+    seg_idx: int, n_segs: int, dest_name: str,
+    lat: float, lon: float, travelled_m: float, total_m: float, speed_mps: float,
+) -> None:
+    """Render a single in-place progress line for an in-flight route."""
+    pct = (travelled_m / total_m * 100.0) if total_m > 0 else 100.0
+    remaining_m = max(0.0, total_m - travelled_m)
+    eta_s = int(remaining_m / speed_mps) if speed_mps > 0 else 0
+    sys.stdout.write(
+        f"\r  {ANSI['dim']}seg {seg_idx + 1}/{n_segs} -> {dest_name}"
+        f"{ANSI['reset']}  {lat:.5f}, {lon:.5f}  "
+        f"{ANSI['dim']}{pct:5.1f}%  {speed_mps / MPH_TO_MPS:.0f} mph  "
+        f"ETA {eta_s}s{ANSI['reset']}   "
+    )
+    sys.stdout.flush()
+
+
+async def drive_route(
+    sim, points: list[tuple[str, float, float]], speed_mps: float,
+    *, tick: float = ROUTE_TICK_S,
+) -> None:
+    """Move the simulated location along `points` at `speed_mps`.
+
+    Interpolates linearly between consecutive waypoints, updating the device
+    every `tick` seconds. Position is keyed to real elapsed wall-clock time
+    per segment, so latency in `sim.set()` doesn't make the trip run slow —
+    it just produces a slightly larger jump on the next update.
+
+    Returns once the final waypoint is reached, leaving the location set
+    there (the caller decides whether to hold, loop, or clear).
+    """
+    total_m = route_total_m(points)
+    n_segs = len(points) - 1
+    done_m = 0.0
+    for i in range(n_segs):
+        _, lat0, lon0 = points[i]
+        name1, lat1, lon1 = points[i + 1]
+        seg_m = haversine_m(lat0, lon0, lat1, lon1)
+        seg_dur = seg_m / speed_mps if speed_mps > 0 else 0.0
+        seg_start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - seg_start
+            frac = 1.0 if seg_dur <= 0 else min(1.0, elapsed / seg_dur)
+            lat = lat0 + (lat1 - lat0) * frac
+            lon = lon0 + (lon1 - lon0) * frac
+            await sim.set(lat, lon)
+            _print_route_progress(
+                i, n_segs, name1, lat, lon, done_m + seg_m * frac,
+                total_m, speed_mps,
+            )
+            if frac >= 1.0:
+                break
+            await asyncio.sleep(tick)
+        done_m += seg_m
+
+
 def cmd_list(_args: argparse.Namespace) -> int:
     locations = load_locations()
     if not locations:
@@ -487,17 +678,43 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-async def cmd_set(args: argparse.Namespace) -> int:
-    _check_privileged_or_tunneld("set")
+def resolve_target(tokens: list[str]) -> tuple[str, float, float]:
+    """Resolve `set` arguments to a (display_name, lat, lon) triple.
+
+    Accepts either a named location or raw coordinates::
+
+        set seattle                   -> look up "seattle"
+        set 47.490308 -122.205647     -> two-token coordinate pair
+        set "47.490308, -122.205647"  -> one-token coordinate pair
+
+    For raw coordinates the display name is just the coordinate string, which
+    flows through to state.json and `gpsspoof status` unchanged.
+    """
+    text = " ".join(tokens)
+    try:
+        coords = parse_coords(text)
+    except ValueError as e:
+        sys.exit(str(e))
+    if coords is not None:
+        lat, lon = coords
+        return (f"{lat}, {lon}", lat, lon)
+    # Not coordinate-shaped, so it must be a single named location.
+    if len(tokens) != 1:
+        sys.exit(f"unrecognized location or coordinates: {text!r}")
+    name = tokens[0]
     locations = load_locations()
-    if args.name not in locations:
+    if name not in locations:
         sys.exit(
-            f"unknown location '{args.name}' "
+            f"unknown location '{name}' "
             f"(available: {', '.join(sorted(locations))})"
         )
-    loc = locations[args.name]
-    lat = float(loc["lat"])
-    lon = float(loc["lon"])
+    loc = locations[name]
+    return (name, float(loc["lat"]), float(loc["lon"]))
+
+
+async def cmd_set(args: argparse.Namespace) -> int:
+    _check_privileged_or_tunneld("set")
+    name, lat, lon = resolve_target(args.target)
 
     iphone = await select_iphone(args.udid)
     print(
@@ -517,13 +734,13 @@ async def cmd_set(args: argparse.Namespace) -> int:
             write_state({
                 "udid": iphone["udid"],
                 "device_name": iphone["device_name"],
-                "name": args.name,
+                "name": name,
                 "lat": lat,
                 "lon": lon,
                 "pid": os.getpid(),
             })
             print()
-            print(f"  SPOOFING ACTIVE  →  {args.name}  ({lat}, {lon})")
+            print(f"  SPOOFING ACTIVE  →  {name}  ({lat}, {lon})")
             print(f"  device           →  {iphone['device_name']}")
             print(f"  pid              →  {os.getpid()}")
             print()
@@ -543,6 +760,100 @@ async def cmd_set(args: argparse.Namespace) -> int:
             finally:
                 held = time.monotonic() - started_at
                 print(f"\n... received stop signal after {held:.1f}s, clearing location...")
+                try:
+                    await sim.clear()
+                    print("... cleared. real GPS resumed.")
+                except Exception as e:
+                    print(f"warning: clear failed: {e}", file=sys.stderr)
+                write_state(None)
+    return 0
+
+
+async def cmd_route(args: argparse.Namespace) -> int:
+    _check_privileged_or_tunneld("route")
+    locations = load_locations()
+    try:
+        speed_mps = parse_speed(args.speed)
+        points = resolve_waypoints(args.waypoints, locations)
+    except ValueError as e:
+        sys.exit(str(e))
+
+    iphone = await select_iphone(args.udid)
+    print(
+        f"connected: {iphone['device_name']} "
+        f"({iphone['product_type']}) iOS {iphone['product_version']}"
+    )
+    print(f"udid:      {iphone['udid']}")
+
+    from pymobiledevice3.services.dvt.instruments.location_simulation import (
+        LocationSimulation,
+    )
+
+    route_label = " -> ".join(p[0] for p in points)
+    total_m = route_total_m(points)
+    eta_s = int(total_m / speed_mps) if speed_mps > 0 else 0
+    print()
+    print(f"  route:  {route_label}")
+    print(f"  speed:  {speed_mps / MPH_TO_MPS:.1f} mph"
+          f"{'  (looping)' if args.loop else ''}")
+    print(f"  length: {total_m / 1609.344:.2f} mi  (~{eta_s}s per pass)")
+    print()
+    print("  press Ctrl-C to clear and exit")
+    print()
+
+    async with open_dvt(iphone["udid"]) as dvt:
+        async with LocationSimulation(dvt) as sim:
+            started_at = time.monotonic()
+            write_state({
+                "udid": iphone["udid"],
+                "device_name": iphone["device_name"],
+                "name": route_label,
+                "lat": points[0][1],
+                "lon": points[0][2],
+                "pid": os.getpid(),
+            })
+
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                except NotImplementedError:
+                    pass
+
+            async def _run() -> None:
+                while True:
+                    await drive_route(sim, points, speed_mps)
+                    if not args.loop:
+                        return
+
+            run_task = asyncio.create_task(_run())
+            stop_task = asyncio.create_task(stop.wait())
+            try:
+                await asyncio.wait(
+                    {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if run_task.done():
+                    exc = run_task.exception()
+                    if exc is not None:
+                        raise exc
+                    if not stop.is_set():
+                        # Reached the end and not looping: hold here until the
+                        # user stops us, mirroring `set`.
+                        print(f"\n  arrived at {points[-1][0]}; holding. "
+                              f"Ctrl-C to clear and exit.")
+                        await stop.wait()
+            finally:
+                # Drain both helper tasks without letting their
+                # results/exceptions (incl. an error from `_run`, which is
+                # re-raised above) prevent the clear below.
+                run_task.cancel()
+                stop_task.cancel()
+                await asyncio.gather(
+                    run_task, stop_task, return_exceptions=True
+                )
+                held = time.monotonic() - started_at
+                print(f"\n... stopping after {held:.1f}s, clearing location...")
                 try:
                     await sim.clear()
                     print("... cleared. real GPS resumed.")
@@ -612,8 +923,18 @@ async def _wait_for_iphone(udid_filter: Optional[str]) -> dict:
         sys.stdout.flush()
 
 
-async def _menu_prompt(locations: dict) -> Optional[str]:
-    """Show numbered menu, return chosen location key or None to quit."""
+async def _menu_prompt(locations: dict) -> Optional[dict]:
+    """Show numbered menu; return a selection dict, or None to quit.
+
+    A selection is one of::
+
+        {"kind": "point", "name": str, "loc": {"lat": .., "lon": ..}}
+        {"kind": "route", "points": [(name, lat, lon), ...], "speed": mps}
+
+    Beyond the numbered entries the user can type a raw coordinate pair
+    ("47.490308, -122.205647") for a single point, or a ``>``-separated
+    route with an optional ``@ speed`` ("kent > seattle > redmond @ 30").
+    """
     names = sorted(locations.keys())
     name_w = max(len(n) for n in names)
     while True:
@@ -625,6 +946,10 @@ async def _menu_prompt(locations: dict) -> Optional[str]:
                   f"{name:<{name_w}}  "
                   f"{float(loc['lat']):>9.4f}, {float(loc['lon']):>10.4f}")
         print(f"  {ANSI['dim']}[ q]{ANSI['reset']}  quit")
+        print(f"  {ANSI['dim']}...or a coordinate pair: "
+              f"47.490308, -122.205647{ANSI['reset']}")
+        print(f"  {ANSI['dim']}...or a route to drive: "
+              f"kent > seattle > redmond @ 30{ANSI['reset']}")
         print()
         try:
             raw = await asyncio.get_event_loop().run_in_executor(
@@ -633,16 +958,36 @@ async def _menu_prompt(locations: dict) -> Optional[str]:
         except (EOFError, KeyboardInterrupt):
             print()
             return None
-        choice = raw.strip().lower()
-        if not choice or choice in ("q", "quit", "exit"):
+        choice = raw.strip()
+        low = choice.lower()
+        if not choice or low in ("q", "quit", "exit"):
             return None
-        if choice.isdigit():
-            idx = int(choice)
+        if low.isdigit():
+            idx = int(low)
             if 1 <= idx <= len(names):
-                return names[idx - 1]
+                nm = names[idx - 1]
+                return {"kind": "point", "name": nm, "loc": locations[nm]}
+            print(f"  {ANSI['yellow']}'{choice}' is out of range{ANSI['reset']}")
+            continue
+        if ">" in choice:
+            try:
+                points, speed = parse_route_line(choice, locations)
+            except ValueError as e:
+                print(f"  {ANSI['yellow']}{e}{ANSI['reset']}")
+                continue
+            return {"kind": "route", "points": points, "speed": speed}
+        try:
+            coords = parse_coords(choice)
+        except ValueError as e:
+            print(f"  {ANSI['yellow']}{e}{ANSI['reset']}")
+            continue
+        if coords is not None:
+            lat, lon = coords
+            return {"kind": "point", "name": f"{lat}, {lon}",
+                    "loc": {"lat": lat, "lon": lon}}
         if choice in locations:
-            return choice
-        print(f"  {ANSI['yellow']}'{raw.strip()}' is not a valid choice"
+            return {"kind": "point", "name": choice, "loc": locations[choice]}
+        print(f"  {ANSI['yellow']}'{choice}' is not a valid choice"
               f"{ANSI['reset']}")
 
 
@@ -775,6 +1120,60 @@ async def _interactive_session(
     return quit_app
 
 
+async def _interactive_route(
+    iphone: dict, points: list[tuple[str, float, float]], speed_mps: float
+) -> bool:
+    """Drive a route in the UI, hold at the end, clear on key/Ctrl-C.
+
+    Returns True to quit the whole UI (Ctrl-C), False to return to the menu.
+    Ctrl-C while the route is still moving aborts and quits the UI.
+    """
+    route_label = " -> ".join(p[0] for p in points)
+    total_m = route_total_m(points)
+    eta_s = int(total_m / speed_mps) if speed_mps > 0 else 0
+
+    print()
+    print(f"{ANSI['bold']}→ driving:{ANSI['reset']} {route_label}")
+    print(f"  {ANSI['dim']}{speed_mps / MPH_TO_MPS:.0f} mph, "
+          f"{total_m / 1609.344:.2f} mi, ~{eta_s}s{ANSI['reset']}")
+
+    from pymobiledevice3.services.dvt.instruments.location_simulation import (
+        LocationSimulation,
+    )
+
+    quit_app = False
+    async with open_dvt(iphone["udid"]) as dvt:
+        async with LocationSimulation(dvt) as sim:
+            started = time.monotonic()
+            write_state({
+                "udid": iphone["udid"],
+                "device_name": iphone["device_name"],
+                "name": route_label,
+                "lat": points[0][1],
+                "lon": points[0][2],
+                "pid": os.getpid(),
+            })
+            try:
+                await drive_route(sim, points, speed_mps)
+                print(f"\n  {ANSI['green']}arrived at {points[-1][0]}"
+                      f"{ANSI['reset']}")
+                print(f"  {ANSI['dim']}press any key to clear and return to "
+                      f"menu  (Ctrl-C to quit){ANSI['reset']}")
+                result = await _wait_for_key_with_ticker(started)
+                quit_app = result == "quit"
+            finally:
+                print(f"  {ANSI['dim']}clearing...{ANSI['reset']}")
+                try:
+                    await sim.clear()
+                except Exception as e:
+                    print(f"  {ANSI['yellow']}warning: clear failed: "
+                          f"{e}{ANSI['reset']}")
+                write_state(None)
+                print(f"  {ANSI['green']}cleared, real GPS resumed"
+                      f"{ANSI['reset']}")
+    return quit_app
+
+
 async def cmd_ui(args: argparse.Namespace) -> int:
     _check_privileged_or_tunneld("ui")
 
@@ -808,7 +1207,15 @@ async def cmd_ui(args: argparse.Namespace) -> int:
             if choice is None:
                 break
             try:
-                if await _interactive_session(iphone, choice, locations[choice]):
+                if choice["kind"] == "route":
+                    done = await _interactive_route(
+                        iphone, choice["points"], choice["speed"]
+                    )
+                else:
+                    done = await _interactive_session(
+                        iphone, choice["name"], choice["loc"]
+                    )
+                if done:
                     break  # Ctrl-C in active session → quit UI
             except KeyboardInterrupt:
                 break
@@ -856,13 +1263,16 @@ def build_parser() -> argparse.ArgumentParser:
             "  gpsspoof ui                       # interactive menu (recommended)\n"
             "  gpsspoof list                     # show known locations\n"
             "  gpsspoof set seattle              # start spoofing (Ctrl-C to stop)\n"
+            "  gpsspoof set 47.490308 -122.205647   # spoof to raw coordinates\n"
+            "  gpsspoof route kent seattle redmond --speed 30   # drive a route\n"
             "  gpsspoof clear                    # stop any active spoof\n"
             "  gpsspoof status                   # show current state\n"
             "  gpsspoof add airport 47.4502 -122.3088\n"
             "  gpsspoof rm airport\n"
             "\n"
-            "Note: `ui`, `set`, `clear` need either root (`sudo gpsspoof ...`)\n"
-            "or a running tunneld daemon. See README: 'Skip sudo with tunneld'."
+            "Note: `ui`, `set`, `route`, `clear` need either root\n"
+            "(`sudo gpsspoof ...`) or a running tunneld daemon.\n"
+            "See README: 'Skip sudo with tunneld'."
         ),
     )
     p.add_argument(
@@ -874,8 +1284,43 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ui", help="interactive menu mode (needs sudo or tunneld)")
     sub.add_parser("list", help="list available named locations")
 
-    p_set = sub.add_parser("set", help="start spoofing to a named location (needs sudo or tunneld)")
-    p_set.add_argument("name", help="name from locations.json")
+    p_set = sub.add_parser(
+        "set",
+        help="start spoofing to a named location or raw coordinates "
+             "(needs sudo or tunneld)",
+    )
+    p_set.add_argument(
+        "target",
+        nargs="+",
+        metavar="LOCATION | LAT LON",
+        help="a name from locations.json (e.g. seattle), or raw coordinates "
+             "(e.g. 47.490308 -122.205647)",
+    )
+
+    p_route = sub.add_parser(
+        "route",
+        help="drive along a series of waypoints at a speed "
+             "(needs sudo or tunneld)",
+    )
+    p_route.add_argument(
+        "waypoints",
+        nargs="+",
+        metavar="WAYPOINT",
+        help="two or more waypoints, each a name (e.g. seattle) or a single "
+             "lat,lon token (e.g. 47.5049,-122.2333). For a southern/western "
+             "point whose token starts with '-', put '--' before the list.",
+    )
+    p_route.add_argument(
+        "--speed",
+        default=str(DEFAULT_ROUTE_SPEED_MPH),
+        help="travel speed; a bare number is mph (default %(default)s). "
+             "Units allowed: e.g. 30mph, 48km/h, 13m/s.",
+    )
+    p_route.add_argument(
+        "--loop",
+        action="store_true",
+        help="repeat the route from the start until Ctrl-C",
+    )
 
     sub.add_parser("clear", help="stop any active spoof on the device (needs sudo or tunneld)")
     sub.add_parser("status", help="show current spoofed location, if any")
@@ -909,6 +1354,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "set":
         try:
             return asyncio.run(cmd_set(args))
+        except KeyboardInterrupt:
+            return 130
+    if args.cmd == "route":
+        try:
+            return asyncio.run(cmd_route(args))
         except KeyboardInterrupt:
             return 130
     if args.cmd == "clear":
