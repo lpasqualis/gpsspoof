@@ -28,12 +28,22 @@ The chain from the command line to "blue dot moves in Apple Maps" is::
                                 ├─ .set(lat, lon)   # simulateLocationWithLat...
                                 └─ .clear()         # stopLocationSimulation
 
-Two distinct privilege boundaries:
+Commands:
 
-* `list`, `status`, `add`, `rm` only read/write the local JSON config and
-  query usbmuxd. They run unprivileged.
-* `set` and `clear` need root because the tunnel setup pauses `remoted`
-  and creates a TCP tunnel to the device's RemoteXPC services.
+* `list`, `status`, `add`, `rm`, `routes` only read/write the local JSON
+  config and query usbmuxd. They run unprivileged.
+* `set` (fixed point), `route` (move through waypoints at a speed, with
+  once/loop/bounce repeat and optional save/load), `map` (a localhost
+  Leaflet UI to click a point or build/drive a route live), `ui`
+  (interactive menu), and `clear` all reach the device, so each needs
+  either root (to build the RemoteXPC tunnel — it pauses `remoted` and
+  creates a TCP tunnel) or a running tunneld daemon that brokers one.
+
+Movement (`route` and the `map` page) repeatedly calls `LocationSimulation
+.set()` with positions interpolated between waypoints; `drive_route`
+integrates distance from real elapsed time × the current speed and paces
+updates adaptively (see `_update_interval`). Named routes persist to
+`~/.config/iphone-spoof/routes.json` (shared by the CLI and the map).
 
 The active spoof session is mirrored to `~/.config/iphone-spoof/state.json`
 purely so `gpsspoof status` can describe what's running. The state file is
@@ -53,9 +63,12 @@ import re
 import signal
 import sys
 import termios
+import threading
 import time
 import tty
+import webbrowser
 from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -79,10 +92,19 @@ SPEED_UNITS = {
     "m/s": 1.0,
 }
 DEFAULT_ROUTE_SPEED_MPH = 30.0
-# How often the simulated position is updated while driving a route. 1s keeps
-# the device-side call rate modest while staying smooth in Apple Maps (at
-# 30 mph that's a ~13 m step between updates).
+# Position-update pacing while driving a route. The interval adapts to the
+# current speed: aim for ~GPS_STEP_TARGET_M between updates, but never slower
+# than ROUTE_TICK_S (keeps low speeds smooth, as Apple Maps interpolates fine
+# at 1s) nor faster than GPS_MIN_INTERVAL_S (so high speeds can't flood the
+# device with set() calls). At 30 mph that's the 1s cadence (~13 m steps); at
+# 300 mph it tightens to ~0.23s so each step stays ~100 ft.
 ROUTE_TICK_S = 1.0
+GPS_STEP_TARGET_M = 30.48   # ~100 feet: target distance moved per update
+GPS_MIN_INTERVAL_S = 0.1    # at most ~10 updates/sec
+
+# `map` server: where to center the browser map when there's no prior fix.
+MAP_DEFAULT_CENTER = (47.6062, -122.3321)  # Seattle
+MAP_DEFAULT_ZOOM = 12
 
 
 def _is_tunneld_running() -> bool:
@@ -180,6 +202,51 @@ def locations_path() -> Path:
 
 def state_path() -> Path:
     return get_config_dir() / "state.json"
+
+
+def routes_path() -> Path:
+    return get_config_dir() / "routes.json"
+
+
+def load_routes() -> dict:
+    """Return the saved-routes map (name -> {points, speed, repeat}).
+
+    `points` is a list of ``[lat, lon]`` pairs, `speed` is in mph, `repeat`
+    is one of once/loop/bounce. Returns {} when no routes file exists yet.
+    """
+    path = routes_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        sys.exit(f"invalid JSON in {path}: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"{path} must contain a JSON object")
+    return data
+
+
+def save_routes(routes: dict) -> None:
+    path = routes_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(routes, indent=2, sort_keys=True) + "\n")
+
+
+def save_route(name: str, points: list, speed_mph: float, repeat: str) -> None:
+    """Create or overwrite a saved route."""
+    routes = load_routes()
+    routes[name] = {"points": points, "speed": speed_mph, "repeat": repeat}
+    save_routes(routes)
+
+
+def delete_route(name: str) -> bool:
+    """Delete a saved route; return True if it existed."""
+    routes = load_routes()
+    if name not in routes:
+        return False
+    del routes[name]
+    save_routes(routes)
+    return True
 
 
 def load_locations() -> dict:
@@ -592,16 +659,36 @@ def _print_route_progress(
     sys.stdout.flush()
 
 
+def _update_interval(speed_mps: float) -> float:
+    """Seconds to wait before the next position update at this speed.
+
+    Targets ~GPS_STEP_TARGET_M (about 100 ft) of travel between updates so
+    movement stays smooth, but clamps the interval to
+    [GPS_MIN_INTERVAL_S, ROUTE_TICK_S]: never slower than the 1s base cadence
+    (low speeds), never faster than ~10/s (so high speeds don't overwhelm the
+    device). A non-positive speed (paused/idle) just uses the base cadence.
+    """
+    if speed_mps <= 0:
+        return ROUTE_TICK_S
+    return min(ROUTE_TICK_S, max(GPS_MIN_INTERVAL_S, GPS_STEP_TARGET_M / speed_mps))
+
+
 async def drive_route(
     sim, points: list[tuple[str, float, float]], speed_mps: float,
-    *, tick: float = ROUTE_TICK_S,
+    *, on_update=None, show_progress: bool = True, get_speed=None,
 ) -> None:
     """Move the simulated location along `points` at `speed_mps`.
 
-    Interpolates linearly between consecutive waypoints, updating the device
-    every `tick` seconds. Position is keyed to real elapsed wall-clock time
-    per segment, so latency in `sim.set()` doesn't make the trip run slow —
-    it just produces a slightly larger jump on the next update.
+    Interpolates linearly between consecutive waypoints. Distance is integrated
+    from real elapsed time times the current speed each tick, so `sim.set()`
+    latency doesn't make the trip run slow — and a mid-trip speed change takes
+    effect on the next tick. The gap between updates adapts to the speed (see
+    `_update_interval`) to stay smooth without flooding the device.
+
+    `get_speed`, if given, is called each tick to read the live speed (m/s);
+    otherwise the fixed `speed_mps` is used. `on_update(lat, lon)` runs after
+    each device update (the map server uses it to follow the dot).
+    `show_progress` prints the in-place terminal progress line.
 
     Returns once the final waypoint is reached, leaving the location set
     there (the caller decides whether to hold, loop, or clear).
@@ -613,26 +700,33 @@ async def drive_route(
         _, lat0, lon0 = points[i]
         name1, lat1, lon1 = points[i + 1]
         seg_m = haversine_m(lat0, lon0, lat1, lon1)
-        seg_dur = seg_m / speed_mps if speed_mps > 0 else 0.0
-        seg_start = time.monotonic()
+        travelled = 0.0
+        prev = time.monotonic()
         while True:
-            elapsed = time.monotonic() - seg_start
-            frac = 1.0 if seg_dur <= 0 else min(1.0, elapsed / seg_dur)
+            now = time.monotonic()
+            spd = get_speed() if get_speed is not None else speed_mps
+            travelled += max(0.0, spd) * (now - prev)
+            prev = now
+            frac = 1.0 if seg_m <= 0 else min(1.0, travelled / seg_m)
             lat = lat0 + (lat1 - lat0) * frac
             lon = lon0 + (lon1 - lon0) * frac
             await sim.set(lat, lon)
-            _print_route_progress(
-                i, n_segs, name1, lat, lon, done_m + seg_m * frac,
-                total_m, speed_mps,
-            )
+            if on_update is not None:
+                on_update(lat, lon)
+            if show_progress:
+                _print_route_progress(
+                    i, n_segs, name1, lat, lon, done_m + seg_m * frac,
+                    total_m, spd,
+                )
             if frac >= 1.0:
                 break
-            await asyncio.sleep(tick)
+            await asyncio.sleep(_update_interval(spd))
         done_m += seg_m
 
 
 async def drive_repeated(
     sim, points: list[tuple[str, float, float]], speed_mps: float, repeat: str,
+    *, on_update=None, show_progress: bool = True, get_speed=None,
 ) -> None:
     """Drive `points` according to `repeat`.
 
@@ -643,19 +737,22 @@ async def drive_repeated(
               (A->B->C->D->E->D->C->B->A->B->...), reversing at each end.
 
     `loop` and `bounce` never return on their own; the caller stops them by
-    cancelling this coroutine.
+    cancelling this coroutine. `on_update` / `show_progress` are forwarded to
+    `drive_route`.
     """
+    opts = {"on_update": on_update, "show_progress": show_progress,
+            "get_speed": get_speed}
     if repeat == "loop":
         cycle = points + [points[0]]  # close the lap by driving last->first
         while True:
-            await drive_route(sim, cycle, speed_mps)
+            await drive_route(sim, cycle, speed_mps, **opts)
     elif repeat == "bounce":
         reverse = list(reversed(points))
         while True:
-            await drive_route(sim, points, speed_mps)
-            await drive_route(sim, reverse, speed_mps)
+            await drive_route(sim, points, speed_mps, **opts)
+            await drive_route(sim, reverse, speed_mps, **opts)
     else:  # once
-        await drive_route(sim, points, speed_mps)
+        await drive_route(sim, points, speed_mps, **opts)
 
 
 def cmd_list(_args: argparse.Namespace) -> int:
@@ -822,13 +919,48 @@ async def cmd_set(args: argparse.Namespace) -> int:
 
 
 async def cmd_route(args: argparse.Namespace) -> int:
+    # --delete only edits the saved-routes file; no device needed.
+    if args.delete:
+        if delete_route(args.delete):
+            print(f"deleted saved route '{args.delete}'")
+            return 0
+        sys.exit(f"no such saved route: '{args.delete}'")
+
     _check_privileged_or_tunneld("route")
     locations = load_locations()
     try:
-        speed_mps = parse_speed(args.speed)
-        points = resolve_waypoints(args.waypoints, locations)
-    except ValueError as e:
+        if args.load:
+            saved = load_routes().get(args.load)
+            if saved is None:
+                sys.exit(f"no such saved route: '{args.load}' "
+                         f"(see `gpsspoof routes`)")
+            points = [(f"{a}, {b}", float(a), float(b))
+                      for a, b in saved.get("points", [])]
+            if len(points) < 2:
+                sys.exit(f"saved route '{args.load}' has fewer than 2 stops")
+            speed_mps = (parse_speed(args.speed) if args.speed is not None
+                         else float(saved.get("speed", DEFAULT_ROUTE_SPEED_MPH))
+                         * MPH_TO_MPS)
+            repeat = args.repeat if args.repeat is not None \
+                else saved.get("repeat", "once")
+        else:
+            if not args.waypoints:
+                sys.exit("provide waypoints, or use --load NAME "
+                         "(see `gpsspoof routes`)")
+            speed_mps = (parse_speed(args.speed) if args.speed is not None
+                         else DEFAULT_ROUTE_SPEED_MPH * MPH_TO_MPS)
+            points = resolve_waypoints(args.waypoints, locations)
+            repeat = args.repeat if args.repeat is not None else "once"
+    except (ValueError, TypeError) as e:
         sys.exit(str(e))
+
+    if repeat not in ("once", "loop", "bounce"):
+        sys.exit(f"invalid repeat mode '{repeat}'")
+
+    if args.save:
+        save_route(args.save, [[la, lo] for _, la, lo in points],
+                   round(speed_mps / MPH_TO_MPS, 4), repeat)
+        print(f"saved route '{args.save}' ({len(points)} stops)")
 
     iphone = await select_iphone(args.udid)
     print(
@@ -842,12 +974,12 @@ async def cmd_route(args: argparse.Namespace) -> int:
     )
 
     route_label = " -> ".join(p[0] for p in points)
-    pass_m = route_pass_m(points, args.repeat)
+    pass_m = route_pass_m(points, repeat)
     eta_s = int(pass_m / speed_mps) if speed_mps > 0 else 0
     mode_note = {"loop": "  (looping)", "bounce": "  (bouncing)"}.get(
-        args.repeat, ""
+        repeat, ""
     )
-    per = " per pass" if args.repeat != "once" else ""
+    per = " per pass" if repeat != "once" else ""
     print()
     print(f"  route:  {route_label}")
     print(f"  speed:  {speed_mps / MPH_TO_MPS:.1f} mph{mode_note}")
@@ -877,7 +1009,7 @@ async def cmd_route(args: argparse.Namespace) -> int:
                     pass
 
             run_task = asyncio.create_task(
-                drive_repeated(sim, points, speed_mps, args.repeat)
+                drive_repeated(sim, points, speed_mps, repeat)
             )
             stop_task = asyncio.create_task(stop.wait())
             try:
@@ -911,6 +1043,22 @@ async def cmd_route(args: argparse.Namespace) -> int:
                 except Exception as e:
                     print(f"warning: clear failed: {e}", file=sys.stderr)
                 write_state(None)
+    return 0
+
+
+def cmd_routes(_args: argparse.Namespace) -> int:
+    routes = load_routes()
+    if not routes:
+        print("(no saved routes; build one with `gpsspoof map` or "
+              "`gpsspoof route ... --save NAME`)")
+        return 0
+    name_w = max(len(n) for n in routes)
+    for name in sorted(routes):
+        r = routes[name]
+        pts = r.get("points", [])
+        print(f"  {name:<{name_w}}  {len(pts):>2} stops, "
+              f"{r.get('speed', DEFAULT_ROUTE_SPEED_MPH)} mph, "
+              f"{r.get('repeat', 'once')}")
     return 0
 
 
@@ -1290,6 +1438,788 @@ async def cmd_ui(args: argparse.Namespace) -> int:
     return 0
 
 
+# Single-page Leaflet map served by `gpsspoof map`. The __LAT__/__LON__/
+# __ZOOM__/__ACTIVE__ tokens are substituted at serve time. Tiles come from
+# OpenStreetMap. "Set point" mode POSTs clicks to /set; "Route" mode collects
+# stops and POSTs them to /route; the page polls /state to follow the dot.
+MAP_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gpsspoof map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { height: 100%; margin: 0; }
+  #map { height: 100%; width: 100%; }
+  #status {
+    position: absolute; z-index: 1000; top: 10px; left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.78); color: #fff;
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, sans-serif;
+    padding: 8px 14px; border-radius: 8px; pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3); white-space: nowrap;
+  }
+  #status.ok { background: rgba(20,120,40,0.92); }
+  #status.pending { background: rgba(150,110,0,0.92); }
+  #status.err { background: rgba(160,30,30,0.94); }
+  #panel {
+    position: absolute; z-index: 1000; top: 10px; left: 10px;
+    background: rgba(255,255,255,0.96); color: #222;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+    padding: 10px 12px; border-radius: 10px; min-width: 200px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+  }
+  #panel h1 { font-size: 12px; margin: 0 0 6px; letter-spacing: .12em; color: #555; }
+  #panel .row { margin: 5px 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #panel button { font: inherit; padding: 3px 10px; border-radius: 6px; border: 1px solid #bbb; background: #f4f4f4; cursor: pointer; }
+  #panel button:hover { background: #e9e9e9; }
+  #panel button.primary { background: #1462ff; color: #fff; border-color: #1462ff; }
+  #panel input, #panel select { font: inherit; padding: 2px 4px; }
+  #panel .muted { color: #666; }
+  #panel .hint { font-size: 11px; color: #888; }
+  #panel .sep { margin-top: 8px; padding-top: 8px; border-top: 1px solid #ddd; }
+  .stop-icon { background: transparent; border: 0; }
+  .stop-bubble {
+    width: 22px; height: 22px; line-height: 22px; text-align: center;
+    border-radius: 50%; background: #1462ff; color: #fff;
+    font-weight: 700; font-size: 12px; border: 2px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.45); cursor: move;
+  }
+  .stop-bubble.sel {
+    background: #ff7a00;
+    box-shadow: 0 0 0 3px rgba(255,122,0,0.45), 0 1px 4px rgba(0,0,0,0.45);
+  }
+  .leaflet-marker-icon { cursor: move; }      /* draggable markers */
+  .route-seg { cursor: copy; }                /* click a segment to insert a stop */
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>GPSSPOOF</h1>
+  <div class="row">
+    <label><input type="radio" name="mode" value="set" checked> Set point</label>
+    <label><input type="radio" name="mode" value="route"> Route</label>
+  </div>
+  <div class="row">
+    speed <input id="speed" type="number" value="30" min="5" step="5" style="width:4.5em"> mph
+    <select id="repeat">
+      <option value="once">once</option>
+      <option value="loop">loop</option>
+      <option value="bounce">bounce</option>
+    </select>
+  </div>
+  <div class="row">
+    <span id="stops" class="muted">stops: 0</span>
+    <button id="undo">Undo</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+  <div class="row" id="routeInfo" style="font-weight:600; color:#1462ff">add 2+ stops</div>
+  <div class="row hint">click map: add at end &middot; click a stop: select (Esc clears)</div>
+  <div class="row hint">selected &rarr; click map inserts before it &middot; Del removes it</div>
+  <div class="row hint">drag: move &middot; right-click: delete &middot; click line: insert</div>
+  <div class="row">
+    <button id="playStop" class="primary">&#9654; Drive</button>
+    <button id="pauseBtn" disabled>&#9208; Pause</button>
+    <label style="margin-left:auto"><input type="checkbox" id="follow"> follow</label>
+  </div>
+  <div class="row sep">
+    <select id="routeSel" style="max-width:8.5em"><option value="">saved routes...</option></select>
+    <button id="loadBtn">Load</button>
+    <button id="delBtn">Del</button>
+  </div>
+  <div class="row">
+    <input id="routeName" placeholder="name" style="width:7em">
+    <button id="saveBtn">Save</button>
+  </div>
+</div>
+<div id="status">loading...</div>
+<div id="map"></div>
+<script>
+  const initial = { lat: __LAT__, lon: __LON__, active: __ACTIVE__ };
+  const statusEl = document.getElementById('status');
+  const map = L.map('map').setView([initial.lat, initial.lon], __ZOOM__);
+  map.zoomControl.setPosition('topright');   // keep the +/- clear of the panel
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  const device = L.marker([initial.lat, initial.lon], { draggable: true }).addTo(map);
+  let mode = 'set';
+  let stops = [];
+  let stopMarkers = [];
+  let lines = [];
+  let layerClickAt = 0;
+  let selectedIndex = null;
+  let driving = false;
+  let paused = false;
+
+  function fmt(lat, lon) { return lat.toFixed(6) + ', ' + lon.toFixed(6); }
+  function show(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
+  function haversineM(a, b) {
+    const R = 6371000, rad = Math.PI / 180;
+    const dphi = (b.lat - a.lat) * rad, dlam = (b.lon - a.lon) * rad;
+    const la1 = a.lat * rad, la2 = b.lat * rad;
+    const x = Math.sin(dphi / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dlam / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(x));
+  }
+  function currentStops() {
+    // live marker positions while dragging, else the committed stops
+    if (stopMarkers.length === stops.length && stopMarkers.length) {
+      return stopMarkers.map(function (mk) { const p = mk.getLatLng(); return { lat: p.lat, lon: p.lng }; });
+    }
+    return stops;
+  }
+  function routeMeters() {
+    const p = currentStops(); let m = 0;
+    for (let i = 0; i < p.length - 1; i++) m += haversineM(p[i], p[i + 1]);
+    return m;
+  }
+  function fmtDur(s) {
+    s = Math.round(s);
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60), sec = s % 60;
+    if (m < 60) return m + 'm ' + (sec < 10 ? '0' : '') + sec + 's';
+    const h = Math.floor(m / 60), mm = m % 60;
+    return h + 'h ' + (mm < 10 ? '0' : '') + mm + 'm';
+  }
+  function curSpeed() { return Number(document.getElementById('speed').value) || 0; }
+  function updateInfo() {
+    const el = document.getElementById('routeInfo');
+    if (stops.length < 2) { el.textContent = 'add 2+ stops'; return; }
+    const m = routeMeters(), spd = curSpeed();
+    const mi = (m / 1609.344).toFixed(2);
+    const t = spd > 0 ? '~' + fmtDur(m / (spd * 0.44704)) : '--';
+    el.textContent = mi + ' mi  ·  ' + t + ' one-way';
+  }
+  if (initial.active) { show('spoofing: ' + fmt(initial.lat, initial.lon), 'ok'); }
+  else { show('real GPS - click the map (Set point) to spoof', ''); }
+
+  async function post(path, body) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    if (!r.ok) {
+      let msg = r.status;
+      try { msg = (await r.json()).error || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    return r.json().catch(function () { return {}; });
+  }
+
+  async function teleport(lat, lon) {
+    show('sending: ' + fmt(lat, lon), 'pending');
+    try { await post('/set', { lat: lat, lon: lon }); show('spoofing: ' + fmt(lat, lon), 'ok'); }
+    catch (e) { show('error: ' + e.message, 'err'); }
+  }
+
+  function stopIcon(n, selected) {
+    return L.divIcon({
+      className: 'stop-icon',
+      html: '<div class="stop-bubble' + (selected ? ' sel' : '') + '">' + n + '</div>',
+      iconSize: [22, 22], iconAnchor: [11, 11]
+    });
+  }
+  function removeStop(i) {
+    stops.splice(i, 1);
+    if (selectedIndex !== null) {
+      if (i === selectedIndex) selectedIndex = null;
+      else if (i < selectedIndex) selectedIndex--;
+    }
+    redrawRoute();
+  }
+  function updateLine() {
+    lines.forEach(function (l) { map.removeLayer(l); });
+    lines = [];
+    const pts = stopMarkers.map(function (mk) { return mk.getLatLng(); });
+    for (let i = 0; i < pts.length - 1; i++) {
+      const seg = L.polyline([pts[i], pts[i + 1]], {
+        color: '#1462ff', weight: 4, opacity: 0.7, className: 'route-seg'
+      }).addTo(map);
+      seg.on('mouseover', function () { seg.setStyle({ weight: 7, opacity: 0.95 }); });
+      seg.on('mouseout', function () { seg.setStyle({ weight: 4, opacity: 0.7 }); });
+      seg.on('click', function (e) {            // insert a stop between i and i+1
+        L.DomEvent.stopPropagation(e);
+        layerClickAt = Date.now();
+        stops.splice(i + 1, 0, { lat: e.latlng.lat, lon: e.latlng.lng });
+        if (selectedIndex !== null && selectedIndex >= i + 1) selectedIndex++;
+        redrawRoute();
+      });
+      lines.push(seg);
+    }
+    updateInfo();
+  }
+  function redrawRoute() {
+    stopMarkers.forEach(function (mk) { map.removeLayer(mk); });
+    stopMarkers = stops.map(function (s, i) {
+      const mk = L.marker([s.lat, s.lon], {
+        draggable: true, icon: stopIcon(i + 1, i === selectedIndex)
+      }).addTo(map);
+      mk.on('click', function (e) {            // click selects (toggles) this stop
+        L.DomEvent.stopPropagation(e);
+        layerClickAt = Date.now();
+        selectedIndex = (selectedIndex === i) ? null : i;
+        redrawRoute();
+      });
+      mk.on('drag', updateLine);               // line follows while dragging
+      mk.on('dragend', function () {
+        const p = mk.getLatLng();
+        stops[i] = { lat: p.lat, lon: p.lng };  // commit the new position
+        updateLine();
+      });
+      mk.on('contextmenu', function (e) {       // right-click removes this stop
+        L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
+        removeStop(i);
+      });
+      return mk;
+    });
+    updateLine();
+    document.getElementById('stops').textContent = 'stops: ' + stops.length
+      + (selectedIndex !== null ? ' (#' + (selectedIndex + 1) + ' selected)' : '');
+  }
+
+  map.on('click', function (e) {
+    if (Date.now() - layerClickAt < 150) return;  // click landed on a stop or line
+    if (mode === 'set') {
+      device.setLatLng(e.latlng);
+      teleport(e.latlng.lat, e.latlng.lng);
+    } else {
+      const stop = { lat: e.latlng.lat, lon: e.latlng.lng };
+      if (selectedIndex !== null) {
+        // insert before the selected stop; the new stop lands at selectedIndex
+        // and stays selected, so repeated clicks keep building before it
+        stops.splice(selectedIndex, 0, stop);
+      } else {
+        stops.push(stop);                       // nothing selected: add at the end
+      }
+      redrawRoute();
+    }
+  });
+  device.on('click', function (e) {            // don't let device clicks add a stop
+    L.DomEvent.stopPropagation(e);
+    layerClickAt = Date.now();
+  });
+  device.on('dragend', function () {
+    const p = device.getLatLng();
+    teleport(p.lat, p.lng);
+  });
+
+  document.querySelectorAll('input[name=mode]').forEach(function (el) {
+    el.addEventListener('change', function () { mode = el.value; });
+  });
+  document.getElementById('follow').addEventListener('change', function () {
+    if (this.checked) map.panTo(device.getLatLng());   // center now when enabled
+  });
+  let speedTimer = null;
+  document.getElementById('speed').addEventListener('input', function () {
+    updateInfo();                                   // instant length/time readout
+    clearTimeout(speedTimer);
+    speedTimer = setTimeout(function () {            // apply to a running drive
+      const s = curSpeed();
+      if (s > 0) post('/speed', { speed: s }).catch(function () {});
+    }, 300);
+  });
+  document.getElementById('undo').addEventListener('click', function () {
+    stops.pop();
+    if (selectedIndex !== null && selectedIndex >= stops.length) selectedIndex = null;
+    redrawRoute();
+  });
+  document.getElementById('clearBtn').addEventListener('click', function () {
+    stops = []; selectedIndex = null; redrawRoute();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectedIndex !== null) { e.preventDefault(); removeStop(selectedIndex); }
+    } else if (e.key === 'Escape') {
+      if (selectedIndex !== null) { selectedIndex = null; redrawRoute(); }
+    }
+  });
+  const playStop = document.getElementById('playStop');
+  const pauseBtn = document.getElementById('pauseBtn');
+  function updateTransport(dr, pa) {
+    driving = dr; paused = pa;
+    if (dr) {
+      playStop.innerHTML = '⏹ Stop';
+      pauseBtn.disabled = false;
+      pauseBtn.innerHTML = pa ? '▶ Resume' : '⏸ Pause';
+    } else {
+      playStop.innerHTML = '▶ Drive';
+      pauseBtn.disabled = true;
+      pauseBtn.innerHTML = '⏸ Pause';
+    }
+  }
+  playStop.addEventListener('click', async function () {
+    if (!driving) {
+      if (stops.length < 2) { show('add at least 2 stops in Route mode', 'err'); return; }
+      show('starting drive...', 'pending');
+      try {
+        await post('/route', {
+          points: stops.map(function (s) { return [s.lat, s.lon]; }),
+          speed: curSpeed() || 30,
+          repeat: document.getElementById('repeat').value
+        });
+        updateTransport(true, false);     // optimistic; poller reconciles
+      } catch (e) { show('error: ' + e.message, 'err'); }
+    } else {
+      try { await post('/stop', {}); updateTransport(false, false); show('stopped', 'ok'); }
+      catch (e) { show('error: ' + e.message, 'err'); }
+    }
+  });
+  pauseBtn.addEventListener('click', async function () {
+    if (!driving) return;
+    try {
+      const r = await post('/pause', {});
+      updateTransport(true, !!r.paused);
+      show(r.paused ? 'paused' : 'resumed', r.paused ? 'pending' : 'ok');
+    } catch (e) { show('error: ' + e.message, 'err'); }
+  });
+
+  // ---- saved routes (load / save / delete) ----
+  let savedRoutes = {};
+  function setMode(m) {
+    mode = m;
+    const radio = document.querySelector('input[name=mode][value=' + m + ']');
+    if (radio) radio.checked = true;
+  }
+  async function refreshRoutes() {
+    try {
+      const r = await fetch('/routes');
+      if (!r.ok) return;
+      savedRoutes = await r.json();
+      const sel = document.getElementById('routeSel');
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">saved routes...</option>';
+      Object.keys(savedRoutes).sort().forEach(function (n) {
+        const o = document.createElement('option');
+        o.value = n; o.textContent = n;
+        sel.appendChild(o);
+      });
+      if (savedRoutes[cur]) sel.value = cur;
+    } catch (e) {}
+  }
+  document.getElementById('loadBtn').addEventListener('click', function () {
+    const n = document.getElementById('routeSel').value;
+    if (!n || !savedRoutes[n]) { show('pick a saved route to load', 'err'); return; }
+    const r = savedRoutes[n];
+    stops = (r.points || []).map(function (p) { return { lat: p[0], lon: p[1] }; });
+    selectedIndex = null;
+    document.getElementById('speed').value = r.speed || 30;
+    document.getElementById('repeat').value = r.repeat || 'once';
+    document.getElementById('routeName').value = n;
+    setMode('route');
+    redrawRoute();
+    if (stops.length) {
+      map.fitBounds(stops.map(function (s) { return [s.lat, s.lon]; }), { padding: [40, 40] });
+    }
+    show('loaded "' + n + '" (' + stops.length + ' stops)', 'ok');
+  });
+  document.getElementById('saveBtn').addEventListener('click', async function () {
+    const n = document.getElementById('routeName').value.trim();
+    if (!n) { show('enter a name to save', 'err'); return; }
+    if (stops.length < 2) { show('add at least 2 stops to save', 'err'); return; }
+    try {
+      await post('/routes/save', {
+        name: n,
+        points: stops.map(function (s) { return [s.lat, s.lon]; }),
+        speed: Number(document.getElementById('speed').value) || 30,
+        repeat: document.getElementById('repeat').value
+      });
+      await refreshRoutes();
+      document.getElementById('routeSel').value = n;
+      show('saved "' + n + '"', 'ok');
+    } catch (e) { show('error: ' + e.message, 'err'); }
+  });
+  document.getElementById('delBtn').addEventListener('click', async function () {
+    const n = document.getElementById('routeSel').value;
+    if (!n) { show('pick a saved route to delete', 'err'); return; }
+    try {
+      await post('/routes/delete', { name: n });
+      await refreshRoutes();
+      show('deleted "' + n + '"', 'ok');
+    } catch (e) { show('error: ' + e.message, 'err'); }
+  });
+  refreshRoutes();
+  updateInfo();
+
+  // Follow the device while it drives a route.
+  setInterval(async function () {
+    try {
+      const r = await fetch('/state');
+      if (!r.ok) return;
+      const st = await r.json();
+      const wasDriving = driving;
+      updateTransport(st.driving, !!st.paused);
+      if (st.driving) {
+        device.setLatLng([st.lat, st.lon]);
+        if (document.getElementById('follow').checked) map.panTo([st.lat, st.lon]);
+        show((st.paused ? 'paused: ' : 'driving: ') + fmt(st.lat, st.lon),
+          st.paused ? 'pending' : 'ok');
+      } else if (wasDriving) {
+        device.setLatLng([st.lat, st.lon]);
+        show('spoofing: ' + fmt(st.lat, st.lon), 'ok');
+      }
+    } catch (e) {}
+  }, 1000);
+</script>
+</body>
+</html>"""
+
+
+class _MapRequestHandler(BaseHTTPRequestHandler):
+    """Serves the map page and drives the device from the browser.
+
+    The owning server carries the shared bits the handler needs:
+      server.html        - the substituted MAP_HTML string
+      server.loop        - the asyncio loop running LocationSimulation
+      server.current     - {lat, lon, active, driving} for GET /state
+      server.apply_set   - coroutine fn (lat, lon) -> teleport
+      server.start_route - coroutine fn (points, speed_mps, repeat) -> drive
+      server.stop_drive  - coroutine fn () -> halt any active drive
+    """
+
+    def log_message(self, *args) -> None:  # silence default stderr logging
+        pass
+
+    def _send(self, code: int, body: str, ctype: str = "application/json") -> None:
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def _run(self, coro):
+        """Run a control coroutine on the asyncio loop and wait for it."""
+        return asyncio.run_coroutine_threadsafe(coro, self.server.loop).result(
+            timeout=20
+        )
+
+    def do_GET(self) -> None:
+        if self.path == "/" or self.path.startswith("/?"):
+            self._send(200, self.server.html, "text/html; charset=utf-8")
+        elif self.path == "/state":
+            state = dict(self.server.current)
+            state["paused"] = getattr(self.server, "paused", False)
+            self._send(200, json.dumps(state))
+        elif self.path == "/routes":
+            self._send(200, json.dumps(load_routes()))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self) -> None:
+        if self.path == "/set":
+            self._handle_set()
+        elif self.path == "/route":
+            self._handle_route()
+        elif self.path == "/stop":
+            self._handle_stop()
+        elif self.path == "/speed":
+            self._handle_speed()
+        elif self.path == "/pause":
+            self._handle_pause()
+        elif self.path == "/routes/save":
+            self._handle_save_route()
+        elif self.path == "/routes/delete":
+            self._handle_delete_route()
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def _handle_set(self) -> None:
+        try:
+            p = self._read_json()
+            lat, lon = float(p["lat"]), float(p["lon"])
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, json.dumps({"error": "expected JSON {lat, lon}"}))
+            return
+        if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+            self._send(400, json.dumps({"error": "lat/lon out of range"}))
+            return
+        try:
+            self._run(self.server.apply_set(lat, lon))
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
+            return
+        self._send(200, json.dumps({"ok": True}))
+
+    def _handle_route(self) -> None:
+        try:
+            p = self._read_json()
+            pts = [(float(a), float(b)) for a, b in p["points"]]
+            speed = float(p.get("speed", DEFAULT_ROUTE_SPEED_MPH))
+            repeat = str(p.get("repeat", "once"))
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, json.dumps(
+                {"error": "expected {points:[[lat,lon],...], speed, repeat}"}))
+            return
+        if len(pts) < 2:
+            self._send(400, json.dumps({"error": "need at least 2 stops"}))
+            return
+        if any(not (-90.0 <= a <= 90.0) or not (-180.0 <= b <= 180.0)
+               for a, b in pts):
+            self._send(400, json.dumps({"error": "a stop is out of range"}))
+            return
+        if speed <= 0:
+            self._send(400, json.dumps({"error": "speed must be positive"}))
+            return
+        if repeat not in ("once", "loop", "bounce"):
+            self._send(400, json.dumps({"error": "repeat must be once|loop|bounce"}))
+            return
+        try:
+            self._run(self.server.start_route(pts, speed * MPH_TO_MPS, repeat))
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
+            return
+        self._send(200, json.dumps({"ok": True}))
+
+    def _handle_stop(self) -> None:
+        try:
+            self._run(self.server.stop_drive())
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
+            return
+        self._send(200, json.dumps({"ok": True}))
+
+    def _handle_speed(self) -> None:
+        try:
+            speed = float(self._read_json()["speed"])  # mph
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, json.dumps({"error": "expected JSON {speed}"}))
+            return
+        if speed <= 0:
+            self._send(400, json.dumps({"error": "speed must be positive"}))
+            return
+        # Plain attribute write picked up by the running drive's get_speed.
+        self.server.speed_mps = speed * MPH_TO_MPS
+        self._send(200, json.dumps({"ok": True}))
+
+    def _handle_pause(self) -> None:
+        # Toggle pause only while a drive is active; the running drive's
+        # get_speed returns 0 while paused, so it holds position.
+        task = getattr(self.server, "drive_task", None)
+        if task is None or task.done():
+            self.server.paused = False
+        else:
+            self.server.paused = not getattr(self.server, "paused", False)
+        self._send(200, json.dumps({"paused": self.server.paused}))
+
+    def _handle_save_route(self) -> None:
+        try:
+            p = self._read_json()
+            name = str(p["name"]).strip()
+            pts = [[float(a), float(b)] for a, b in p["points"]]
+            speed = float(p.get("speed", DEFAULT_ROUTE_SPEED_MPH))
+            repeat = str(p.get("repeat", "once"))
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, json.dumps(
+                {"error": "expected {name, points:[[lat,lon],...], speed, repeat}"}))
+            return
+        if not name:
+            self._send(400, json.dumps({"error": "name is required"}))
+            return
+        if len(pts) < 2:
+            self._send(400, json.dumps({"error": "need at least 2 stops"}))
+            return
+        if any(not (-90.0 <= a <= 90.0) or not (-180.0 <= b <= 180.0)
+               for a, b in pts):
+            self._send(400, json.dumps({"error": "a stop is out of range"}))
+            return
+        if speed <= 0 or repeat not in ("once", "loop", "bounce"):
+            self._send(400, json.dumps({"error": "bad speed or repeat"}))
+            return
+        try:
+            save_route(name, pts, speed, repeat)
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
+            return
+        self._send(200, json.dumps({"ok": True}))
+
+    def _handle_delete_route(self) -> None:
+        try:
+            name = str(self._read_json()["name"]).strip()
+        except (KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, json.dumps({"error": "expected {name}"}))
+            return
+        if delete_route(name):
+            self._send(200, json.dumps({"ok": True}))
+        else:
+            self._send(404, json.dumps({"error": "no such route"}))
+
+
+async def cmd_map(args: argparse.Namespace) -> int:
+    _check_privileged_or_tunneld("map")
+
+    iphone = await select_iphone(args.udid)
+    print(
+        f"connected: {iphone['device_name']} "
+        f"({iphone['product_type']}) iOS {iphone['product_version']}"
+    )
+    print(f"udid:      {iphone['udid']}")
+
+    from pymobiledevice3.services.dvt.instruments.location_simulation import (
+        LocationSimulation,
+    )
+
+    # Center on the last known fix if we have one, else a sensible default.
+    state = read_state()
+    if state and isinstance(state.get("lat"), (int, float)) \
+            and isinstance(state.get("lon"), (int, float)):
+        center_lat, center_lon = float(state["lat"]), float(state["lon"])
+    else:
+        center_lat, center_lon = MAP_DEFAULT_CENTER
+    html = (MAP_HTML
+            .replace("__LAT__", repr(center_lat))
+            .replace("__LON__", repr(center_lon))
+            .replace("__ZOOM__", str(MAP_DEFAULT_ZOOM))
+            .replace("__ACTIVE__", "false"))
+
+    async with open_dvt(iphone["udid"]) as dvt:
+        async with LocationSimulation(dvt) as sim:
+            loop = asyncio.get_running_loop()
+            control = asyncio.Lock()  # serializes all device-control ops
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _MapRequestHandler)
+            server.html = html
+            server.loop = loop
+            server.current = {"lat": center_lat, "lon": center_lon,
+                              "active": False, "driving": False}
+            server.drive_task = None
+            # Live speed (m/s) the active drive reads each tick; POST /speed
+            # updates it so a change takes hold without restarting the drive.
+            server.speed_mps = DEFAULT_ROUTE_SPEED_MPH * MPH_TO_MPS
+            # While paused the drive holds position (get_speed returns 0).
+            server.paused = False
+
+            def set_current(lat, lon, *, active=True, driving=False) -> None:
+                server.current = {"lat": lat, "lon": lon,
+                                  "active": active, "driving": driving}
+
+            async def cancel_drive() -> None:
+                task = server.drive_task
+                server.drive_task = None
+                if task is not None and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            def record_state(name, lat, lon) -> None:
+                write_state({
+                    "udid": iphone["udid"],
+                    "device_name": iphone["device_name"],
+                    "name": name,
+                    "lat": lat,
+                    "lon": lon,
+                    "pid": os.getpid(),
+                })
+
+            async def apply_set(lat, lon) -> None:
+                async with control:
+                    await cancel_drive()
+                    server.paused = False
+                    await sim.set(lat, lon)
+                    set_current(lat, lon, active=True, driving=False)
+                    record_state(f"{lat}, {lon}", lat, lon)
+                    _progress(f"set {lat:.6f}, {lon:.6f}")
+
+            async def start_route(pts, speed_mps, repeat) -> None:
+                named = [(f"{la}, {lo}", la, lo) for la, lo in pts]
+                async with control:
+                    await cancel_drive()
+                    server.speed_mps = speed_mps  # seed live speed for this run
+                    server.paused = False
+
+                    def on_update(la, lo):
+                        set_current(la, lo, active=True, driving=True)
+
+                    async def runner():
+                        await drive_repeated(
+                            sim, named, speed_mps, repeat,
+                            on_update=on_update, show_progress=False,
+                            get_speed=lambda: 0.0 if server.paused
+                            else server.speed_mps,
+                        )
+                        # `once` finished: hold at the final stop.
+                        server.paused = False
+                        set_current(named[-1][1], named[-1][2],
+                                    active=True, driving=False)
+                        _progress("route complete; holding at final stop")
+
+                    server.drive_task = asyncio.create_task(runner())
+                    label = " -> ".join(p[0] for p in named)
+                    record_state(label, named[0][1], named[0][2])
+                    _progress(f"driving {len(named)} stops @ "
+                              f"{speed_mps / MPH_TO_MPS:.0f} mph ({repeat})")
+
+            async def stop_drive() -> None:
+                async with control:
+                    await cancel_drive()
+                    server.paused = False
+                    cur = server.current
+                    set_current(cur["lat"], cur["lon"],
+                                active=cur.get("active", True), driving=False)
+                    _progress("drive stopped (holding)")
+
+            server.apply_set = apply_set
+            server.start_route = start_route
+            server.stop_drive = stop_drive
+
+            url = f"http://127.0.0.1:{server.server_address[1]}/"
+            thread = threading.Thread(
+                target=server.serve_forever, name="gpsspoof-map", daemon=True
+            )
+            thread.start()
+
+            print()
+            print(f"  {ANSI['bold']}map ready{ANSI['reset']}  ->  {url}")
+            print(f"  device     ->  {iphone['device_name']} "
+                  f"[{iphone['udid']}]")
+            print(f"  {ANSI['dim']}click to set a point, or switch to Route "
+                  f"mode to build and Drive a route; Ctrl-C to clear and exit"
+                  f"{ANSI['reset']}")
+            print()
+            try:
+                webbrowser.open(url)
+            except Exception:
+                print(f"  {ANSI['yellow']}could not auto-open a browser; "
+                      f"open the URL above manually{ANSI['reset']}")
+
+            stop = asyncio.Event()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                except NotImplementedError:
+                    pass
+
+            try:
+                await stop.wait()
+            finally:
+                print("\n... shutting down map server, clearing location...")
+                await cancel_drive()
+                server.shutdown()
+                server.server_close()
+                try:
+                    await sim.clear()
+                    print("... cleared. real GPS resumed.")
+                except Exception as e:
+                    print(f"warning: clear failed: {e}", file=sys.stderr)
+                write_state(None)
+    return 0
+
+
 async def cmd_clear(args: argparse.Namespace) -> int:
     _check_privileged_or_tunneld("clear")
     state = read_state()
@@ -1324,17 +2254,21 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Common usage:\n"
             "  gpsspoof ui                       # interactive menu (recommended)\n"
+            "  gpsspoof map                      # click-on-a-map browser UI\n"
             "  gpsspoof list                     # show known locations\n"
             "  gpsspoof set seattle              # start spoofing (Ctrl-C to stop)\n"
             "  gpsspoof set 47.490308 -122.205647   # spoof to raw coordinates\n"
             "  gpsspoof route kent seattle redmond --speed 30   # drive a route\n"
             "  gpsspoof route kent seattle redmond --bounce     # there-and-back\n"
+            "  gpsspoof route kent seattle --save commute       # save + drive\n"
+            "  gpsspoof routes                   # list saved routes\n"
+            "  gpsspoof route --load commute --loop   # drive a saved route\n"
             "  gpsspoof clear                    # stop any active spoof\n"
             "  gpsspoof status                   # show current state\n"
             "  gpsspoof add airport 47.4502 -122.3088\n"
             "  gpsspoof rm airport\n"
             "\n"
-            "Note: `ui`, `set`, `route`, `clear` need either root\n"
+            "Note: `ui`, `map`, `set`, `route`, `clear` need either root\n"
             "(`sudo gpsspoof ...`) or a running tunneld daemon.\n"
             "See README: 'Skip sudo with tunneld'."
         ),
@@ -1346,6 +2280,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     sub.add_parser("ui", help="interactive menu mode (needs sudo or tunneld)")
+    sub.add_parser(
+        "map",
+        help="open a clickable browser map to set the location "
+             "(needs sudo or tunneld)",
+    )
     sub.add_parser("list", help="list available named locations")
 
     p_set = sub.add_parser(
@@ -1363,24 +2302,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_route = sub.add_parser(
         "route",
-        help="drive along a series of waypoints at a speed "
+        help="drive a route of waypoints, or a saved route, at a speed "
              "(needs sudo or tunneld)",
     )
     p_route.add_argument(
         "waypoints",
-        nargs="+",
+        nargs="*",
         metavar="WAYPOINT",
         help="two or more waypoints, each a name (e.g. seattle) or a single "
              "lat,lon token (e.g. 47.5049,-122.2333). For a southern/western "
-             "point whose token starts with '-', put '--' before the list.",
+             "point whose token starts with '-', put '--' before the list. "
+             "Omit when using --load.",
     )
     p_route.add_argument(
         "--speed",
-        default=str(DEFAULT_ROUTE_SPEED_MPH),
-        help="travel speed; a bare number is mph (default %(default)s). "
-             "Units allowed: e.g. 30mph, 48km/h, 13m/s.",
+        default=None,
+        help=f"travel speed; a bare number is mph (default "
+             f"{DEFAULT_ROUTE_SPEED_MPH}). Units allowed: e.g. 30mph, "
+             f"48km/h, 13m/s.",
     )
-    p_route.set_defaults(repeat="once")
+    p_route.add_argument(
+        "--save", metavar="NAME",
+        help="save this route under NAME (to routes.json) before driving",
+    )
+    p_route.add_argument(
+        "--load", metavar="NAME",
+        help="drive a previously saved route by NAME (see `gpsspoof routes`)",
+    )
+    p_route.add_argument(
+        "--delete", metavar="NAME",
+        help="delete the saved route NAME and exit (no device needed)",
+    )
+    p_route.set_defaults(repeat=None)
     repeat_mode = p_route.add_mutually_exclusive_group()
     repeat_mode.add_argument(
         "--loop",
@@ -1394,6 +2347,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="repeat back and forth, reversing at each end "
              "(...second-last -> last -> second-last...) until Ctrl-C",
     )
+
+    sub.add_parser("routes", help="list saved routes (from routes.json)")
 
     sub.add_parser("clear", help="stop any active spoof on the device (needs sudo or tunneld)")
     sub.add_parser("status", help="show current spoofed location, if any")
@@ -1424,6 +2379,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_add(args)
     if args.cmd == "rm":
         return cmd_rm(args)
+    if args.cmd == "routes":
+        return cmd_routes(args)
     if args.cmd == "set":
         try:
             return asyncio.run(cmd_set(args))
@@ -1442,6 +2399,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "ui":
         try:
             return asyncio.run(cmd_ui(args))
+        except KeyboardInterrupt:
+            return 130
+    if args.cmd == "map":
+        try:
+            return asyncio.run(cmd_map(args))
         except KeyboardInterrupt:
             return 130
     return 2

@@ -1,8 +1,11 @@
 # gpsspoof
 
-A small macOS CLI that spoofs the GPS location of a USB-connected iPhone
+A small macOS tool that spoofs the GPS location of a USB-connected iPhone
 using [`pymobiledevice3`](https://github.com/doronz88/pymobiledevice3).
-Pure Python, no GUI. Targets iOS 17 and newer (verified on iOS 26).
+Set a fixed point, **drive a route** through waypoints at a chosen speed
+(once / loop / bounce), or open a **clickable browser map** to place and
+drive routes live. Pure Python — the map UI is a small page served on
+localhost, no native GUI. Targets iOS 17 and newer (verified on iOS 26).
 
 ```text
 $ sudo gpsspoof set seattle
@@ -37,9 +40,11 @@ udid:      00008030-0123456789ABCDEF
 - [Quick start](#quick-start)
 - [Command reference](#command-reference)
   - [`gpsspoof ui`](#gpsspoof-ui)
+  - [`gpsspoof map`](#gpsspoof-map)
   - [`gpsspoof list`](#gpsspoof-list)
   - [`gpsspoof set`](#gpsspoof-set-location--lat-lon)
   - [`gpsspoof route`](#gpsspoof-route-waypoints)
+  - [`gpsspoof routes`](#gpsspoof-routes)
   - [`gpsspoof clear`](#gpsspoof-clear)
   - [`gpsspoof status`](#gpsspoof-status)
   - [`gpsspoof add`](#gpsspoof-add-name-lat-lon)
@@ -150,6 +155,7 @@ symlink the pipx entry into `/usr/local/bin` as above.
 
 ```bash
 gpsspoof ui                       # interactive menu (recommended)
+gpsspoof map                      # click-on-a-map browser UI
 
 gpsspoof                          # no args ⇒ prints help
 gpsspoof list                     # list named locations
@@ -163,7 +169,7 @@ gpsspoof add airport 47.4502 -122.3088   # add or update a location
 gpsspoof rm airport                      # remove one
 ```
 
-> `ui`, `set`, `route`, `clear` need either `sudo` **or** a running tunneld
+> `ui`, `map`, `set`, `route`, `clear` need either `sudo` **or** a running tunneld
 > daemon (set up once — see [Skip sudo with tunneld](#skip-sudo-with-tunneld)).
 > The tool auto-detects tunneld; if it isn't running, prefix the
 > command with `sudo`.
@@ -233,6 +239,82 @@ Besides the numbered entries, you can type at the `>` prompt:
   keypress; `loop`/`bounce` run until Ctrl-C (Ctrl-C while moving quits
   the UI). See [`gpsspoof route`](#gpsspoof-route-waypoints) for details.
 
+### `gpsspoof map`
+
+Open a **clickable map in your browser** to set the location *and* build
+and drive routes. **Needs root or a running tunneld.** It connects to the
+iPhone, starts a small local web server on `127.0.0.1` (a random free
+port), opens your default browser to it, and holds until you press
+Ctrl-C (which clears the spoof and restores real GPS).
+
+```bash
+gpsspoof map
+```
+
+```text
+connected: My iPhone (iPhone18,2) iOS 26.5.1
+udid:      00008030-0123456789ABCDEF
+... borrowed tunnel from tunneld in 0.2s (no root needed in this process)
+
+  map ready  ->  http://127.0.0.1:51847/
+  device     ->  My iPhone [00008030-0123456789ABCDEF]
+  click to set a point, or switch to Route mode to build and Drive a route; Ctrl-C to clear and exit
+
+... set 47.490308, -122.205647
+... driving 3 stops @ 30 mph (loop)
+^C
+... shutting down map server, clearing location...
+... cleared. real GPS resumed.
+```
+
+The page has a small control panel with two modes:
+
+- **Set point** (default): click anywhere to teleport the device there;
+  drag the marker to fine-tune.
+- **Route**: build a path of numbered stops, then drive it. Set a
+  **speed** (mph) and a repeat mode (**once / loop / bounce**, same
+  meanings as [`gpsspoof route`](#gpsspoof-route-waypoints)), then press
+  **▶ Drive**; the marker follows the device live as it moves. The same
+  button becomes **⏹ Stop** while running (press to end and hold). **⏸
+  Pause** freezes the dot in place and becomes **▶ Resume** to continue.
+  The panel shows the route's **length** (miles) and the
+  **one-way time** at the current speed, updating as you edit stops or
+  change the speed. Changing the speed **while a drive is running** takes
+  effect immediately — no need to stop and restart. Tick **follow** to
+  keep the map centered on the dot as it drives (toggle off to pan freely).
+
+  Editing the stops:
+
+  - **click the map** — add a stop at the end;
+  - **click a stop** — select it (highlighted orange; click again or
+    press <kbd>Esc</kbd> to deselect);
+  - with a stop selected, **click the map** — insert the new stop
+    *before* the selected one (so selecting #5 and clicking makes the new
+    stop #5 and the rest shift down); this is how you add a stop before
+    #1;
+  - **click a line** — insert a stop at that point in the middle;
+  - **drag a stop** — move it; **right-click** a stop, or select it and
+    press <kbd>Delete</kbd>/<kbd>Backspace</kbd> — remove it;
+  - **Undo** / **Clear** — drop the last stop / empty the route.
+
+  Saved routes (shared with the CLI's
+  [`routes`](#gpsspoof-routes) / `route --load`): type a name and
+  **Save** to store the current stops/speed/mode; pick one from the
+  dropdown and **Load** to bring it onto the map (or **Del** to remove
+  it). Saving with an existing name overwrites it, so you can load, edit,
+  and re-save.
+
+A status pill shows the current state ("real GPS", "spoofing: …", or
+"driving: …"). Starting a route or clicking a new point supersedes
+whatever was running; Ctrl-C in the terminal clears everything.
+
+The map uses [Leaflet](https://leafletjs.com/) with OpenStreetMap tiles,
+so it needs an internet connection to load the map (the tiles and the
+Leaflet library are fetched from public CDNs). No API key is required.
+The server binds to localhost only and is not reachable from other
+machines. If a browser doesn't open automatically, open the printed URL
+yourself.
+
 ### `gpsspoof list`
 
 Print all named locations from `~/.config/iphone-spoof/locations.json`,
@@ -277,9 +359,11 @@ session so `gpsspoof status` from any other shell can describe it.
 
 Simulate **movement**: travel in straight-line segments through two or
 more waypoints at a chosen speed, instead of standing at one point.
-**Needs root or a running tunneld.** The device's position is updated
-once a second, interpolated along the line between consecutive waypoints,
-so Apple Maps shows the blue dot gliding along the route.
+**Needs root or a running tunneld.** The device's position is interpolated
+along the line between consecutive waypoints, so Apple Maps shows the blue
+dot gliding along the route. The update rate adapts to the speed — about
+once a second at city speeds, tightening at high speeds to keep each step
+near 100 ft (capped at ~10 updates/second so it never floods the device).
 
 Each waypoint is either a name from `locations.json` or a single
 `lat,lon` token (one shell argument — comma-separate the pair, no space,
@@ -330,6 +414,37 @@ Notes:
   `sudo gpsspoof route --speed 50 -- -33.8688,151.2093 -37.8136,144.9631`.
 - `gpsspoof status` reports the route as its `start -> ... -> end` label.
 
+**Saving and reusing routes.** A route (its stops, speed, and repeat
+mode) can be saved by name to `~/.config/iphone-spoof/routes.json` and
+replayed later — from the CLI or from the [`map`](#gpsspoof-map) page,
+which read and write the same file:
+
+```bash
+sudo gpsspoof route kent seattle redmond --speed 30 --save commute  # save, then drive
+sudo gpsspoof route --load commute                                  # drive the saved route
+sudo gpsspoof route --load commute --bounce --speed 45              # override mode/speed on load
+gpsspoof route --delete commute                                     # delete (no device needed)
+gpsspoof routes                                                     # list saved routes
+```
+
+`--save` stores the route before driving; `--load` replays it (any
+`--speed` / `--loop` / `--bounce` you also pass override what was saved).
+See [`gpsspoof routes`](#gpsspoof-routes) to list them.
+
+### `gpsspoof routes`
+
+List the saved routes from `~/.config/iphone-spoof/routes.json` (created
+on first save). Runs unprivileged.
+
+```text
+  commute  2 stops, 30 mph, loop
+  scenic   5 stops, 25 mph, bounce
+```
+
+Save routes with `gpsspoof route ... --save NAME` or from the
+[`map`](#gpsspoof-map) page; delete them with
+`gpsspoof route --delete NAME` or the map's **Del** button.
+
 ### `gpsspoof clear`
 
 Send a clear-location command to the device, restoring real GPS.
@@ -375,8 +490,8 @@ Remove a location. Errors if `NAME` isn't present.
 ### `gpsspoof --udid UDID …`
 
 Disambiguate when multiple iPhones are plugged in. Applies to `set`,
-`route`, `clear`, and `status`. Without it, those commands refuse to
-guess and print all UDIDs.
+`route`, `map`, `clear`, and `status`. Without it, those commands refuse
+to guess and print all UDIDs.
 
 ## Locations file
 
@@ -714,11 +829,13 @@ device appears exactly once.
 
 - **macOS only.** The tunnel setup uses `utun` and `SIGSTOP` of
   `remoted`, both Darwin-specific.
-- **One simulated point at a time.** No GPX route playback (the
-  underlying `LocationSimulation.play_gpx_file()` exists but isn't
-  exposed). Add a `play` subcommand if you need it.
-- **No altitude / speed / course.** Apple's DVT API only takes
-  lat/lon.
+- **Straight-line movement, not road-snapped.** `route` and the map
+  drive the point in straight segments between waypoints — there's no
+  routing engine, and no GPX file import (the underlying
+  `LocationSimulation.play_gpx_file()` exists but isn't exposed).
+- **No native altitude / course; speed is emulated.** Apple's DVT API
+  only takes lat/lon, so "speed" is faked by stepping the point over
+  time. There's no altitude or heading.
 - **Ctrl-C clear is best-effort.** If the device is already
   disconnected when you Ctrl-C, the clear call fails and you'll see
   `warning: clear failed: …`. Reconnect and run `sudo gpsspoof clear`.
