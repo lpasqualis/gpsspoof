@@ -1604,7 +1604,11 @@ MAP_HTML = """<!DOCTYPE html>
   const carIcon = L.divIcon({ className: 'car-icon', html: '<div class="car">__CAR_IMG__</div>', iconSize: __CAR_SIZE__, iconAnchor: __CAR_ANCHOR__ });
   const device = L.marker([initial.lat, initial.lon], { draggable: true, icon: carIcon }).addTo(map);
   function carEl() { const e = device.getElement(); return e ? e.querySelector('.car') : null; }
-  function rotateCar(deg) { const el = carEl(); if (el) el.style.transform = 'rotate(' + deg + 'deg)'; }
+  let carHeading = 0;
+  function rotateCar(deg) {           // deg = target bearing (0-360); keep carHeading CONTINUOUS so a
+    carHeading += ((deg - carHeading) % 360 + 540) % 360 - 180;   // north crossing turns the short way
+    const el = carEl(); if (el) el.style.transform = 'rotate(' + carHeading + 'deg)';   // (no wild spin)
+  }
   function bearing(a, b) {
     const rad = Math.PI / 180, deg = 180 / Math.PI;
     const la1 = a.lat * rad, la2 = b.lat * rad, dlon = (b.lon - a.lon) * rad;
