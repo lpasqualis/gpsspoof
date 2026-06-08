@@ -7,6 +7,11 @@ Set a fixed point, **drive a route** through waypoints at a chosen speed
 drive routes live. Pure Python — the map UI is a small page served on
 localhost, no native GUI. Targets iOS 17 and newer (verified on iOS 26).
 
+![The gpsspoof map: a multi-stop route with the car marker driving it, live distance/ETA, speed, and play/pause/stop controls](assets/mapview.png)
+
+*`gpsspoof map` — click to drop stops, then drive the route; the car
+marker follows live and the panel shows distance and one-way time.*
+
 ```text
 $ sudo gpsspoof set seattle
 connected: My iPhone (iPhone18,2) iOS 26.4.2
