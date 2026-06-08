@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import math
 import os
@@ -1438,6 +1439,57 @@ async def cmd_ui(args: argparse.Namespace) -> int:
     return 0
 
 
+CAR_DISPLAY_MAX_PX = 48   # longest side of the position-marker car icon
+# Used only if assets/Corvette.png can't be read; points north (nose up).
+CAR_FALLBACK_SVG = (
+    '<svg width="36" height="36" viewBox="0 0 36 36">'
+    '<path d="M18 1.5C21.5 1.5 23.5 6 23.5 12L23.5 25C23.5 31 21.5 34.5 18 '
+    '34.5C14.5 34.5 12.5 31 12.5 25L12.5 12C12.5 6 14.5 1.5 18 1.5Z" '
+    'fill="#ffffff" stroke="#2a2a2a" stroke-width="1.2" stroke-linejoin="round"/>'
+    '<rect x="8.5" y="9" width="4" height="6" rx="1.5" fill="#1a1a1a"/>'
+    '<rect x="23.5" y="9" width="4" height="6" rx="1.5" fill="#1a1a1a"/>'
+    '<rect x="8.5" y="21" width="4" height="6" rx="1.5" fill="#1a1a1a"/>'
+    '<rect x="23.5" y="21" width="4" height="6" rx="1.5" fill="#1a1a1a"/>'
+    '<path d="M14.5 10L21.5 10L20.5 15L15.5 15Z" fill="#9bc4ea"/>'
+    '<path d="M15.5 23L20.5 23L21.5 27L14.5 27Z" fill="#9bc4ea"/></svg>'
+)
+
+
+def _png_size(data: bytes) -> Optional[tuple[int, int]]:
+    """Return (width, height) from a PNG's IHDR header, or None if not a PNG."""
+    if (len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n"
+            and data[12:16] == b"IHDR"):
+        return (int.from_bytes(data[16:20], "big"),
+                int.from_bytes(data[20:24], "big"))
+    return None
+
+
+def car_icon_html() -> tuple[str, str, str]:
+    """Build the car marker's (inner HTML, iconSize, iconAnchor) for the page.
+
+    Embeds assets/Corvette.png as a base64 data-URI (kept aspect-correct,
+    longest side CAR_DISPLAY_MAX_PX); falls back to a built-in SVG car if the
+    image can't be read. The returned size/anchor strings are JS array
+    literals for the Leaflet divIcon.
+    """
+    path = Path(__file__).resolve().parent / "assets" / "Corvette.png"
+    try:
+        data = path.read_bytes()
+        size = _png_size(data)
+        if size:
+            w, h = size
+            scale = CAR_DISPLAY_MAX_PX / max(w, h)
+            dw, dh = round(w * scale), round(h * scale)
+        else:
+            dw = dh = CAR_DISPLAY_MAX_PX
+        b64 = base64.b64encode(data).decode("ascii")
+        img = (f'<img src="data:image/png;base64,{b64}" '
+               f'width="{dw}" height="{dh}"/>')
+        return img, f"[{dw}, {dh}]", f"[{dw / 2}, {dh / 2}]"
+    except OSError:
+        return CAR_FALLBACK_SVG, "[36, 36]", "[18, 18]"
+
+
 # Single-page Leaflet map served by `gpsspoof map`. The __LAT__/__LON__/
 # __ZOOM__/__ACTIVE__ tokens are substituted at serve time. Tiles come from
 # OpenStreetMap. "Set point" mode POSTs clicks to /set; "Route" mode collects
@@ -1493,6 +1545,9 @@ MAP_HTML = """<!DOCTYPE html>
   }
   .leaflet-marker-icon { cursor: move; }      /* draggable markers */
   .route-seg { cursor: copy; }                /* click a segment to insert a stop */
+  .car-icon { background: transparent; border: 0; }
+  .car { transform-origin: 50% 50%; transition: transform 0.15s linear; line-height: 0; }
+  .car svg, .car img { display: block; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
 </style>
 </head>
 <body>
@@ -1546,7 +1601,17 @@ MAP_HTML = """<!DOCTYPE html>
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
 
-  const device = L.marker([initial.lat, initial.lon], { draggable: true }).addTo(map);
+  const carIcon = L.divIcon({ className: 'car-icon', html: '<div class="car">__CAR_IMG__</div>', iconSize: __CAR_SIZE__, iconAnchor: __CAR_ANCHOR__ });
+  const device = L.marker([initial.lat, initial.lon], { draggable: true, icon: carIcon }).addTo(map);
+  function carEl() { const e = device.getElement(); return e ? e.querySelector('.car') : null; }
+  function rotateCar(deg) { const el = carEl(); if (el) el.style.transform = 'rotate(' + deg + 'deg)'; }
+  function bearing(a, b) {
+    const rad = Math.PI / 180, deg = 180 / Math.PI;
+    const la1 = a.lat * rad, la2 = b.lat * rad, dlon = (b.lon - a.lon) * rad;
+    const y = Math.sin(dlon) * Math.cos(la2);
+    const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dlon);
+    return (Math.atan2(y, x) * deg + 360) % 360;
+  }
   let mode = 'set';
   let stops = [];
   let stopMarkers = [];
@@ -1555,6 +1620,7 @@ MAP_HTML = """<!DOCTYPE html>
   let selectedIndex = null;
   let driving = false;
   let paused = false;
+  let lastCarPos = null;
 
   function fmt(lat, lon) { return lat.toFixed(6) + ', ' + lon.toFixed(6); }
   function show(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
@@ -1612,6 +1678,7 @@ MAP_HTML = """<!DOCTYPE html>
   }
 
   async function teleport(lat, lon) {
+    lastCarPos = { lat: lat, lon: lon };   // so the next drive heads correctly
     show('sending: ' + fmt(lat, lon), 'pending');
     try { await post('/set', { lat: lat, lon: lon }); show('spoofing: ' + fmt(lat, lon), 'ok'); }
     catch (e) { show('error: ' + e.message, 'err'); }
@@ -1856,6 +1923,10 @@ MAP_HTML = """<!DOCTYPE html>
       const wasDriving = driving;
       updateTransport(st.driving, !!st.paused);
       if (st.driving) {
+        if (!wasDriving) lastCarPos = null;       // fresh heading at drive start
+        const np = { lat: st.lat, lon: st.lon };
+        if (lastCarPos && haversineM(lastCarPos, np) > 1) rotateCar(bearing(lastCarPos, np));
+        lastCarPos = np;
         device.setLatLng([st.lat, st.lon]);
         if (document.getElementById('follow').checked) map.panTo([st.lat, st.lon]);
         show((st.paused ? 'paused: ' : 'driving: ') + fmt(st.lat, st.lon),
@@ -2079,11 +2150,15 @@ async def cmd_map(args: argparse.Namespace) -> int:
         center_lat, center_lon = float(state["lat"]), float(state["lon"])
     else:
         center_lat, center_lon = MAP_DEFAULT_CENTER
+    car_img, car_size, car_anchor = car_icon_html()
     html = (MAP_HTML
             .replace("__LAT__", repr(center_lat))
             .replace("__LON__", repr(center_lon))
             .replace("__ZOOM__", str(MAP_DEFAULT_ZOOM))
-            .replace("__ACTIVE__", "false"))
+            .replace("__ACTIVE__", "false")
+            .replace("__CAR_SIZE__", car_size)
+            .replace("__CAR_ANCHOR__", car_anchor)
+            .replace("__CAR_IMG__", car_img))
 
     async with open_dvt(iphone["udid"]) as dvt:
         async with LocationSimulation(dvt) as sim:

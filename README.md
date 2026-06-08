@@ -274,7 +274,8 @@ The page has a small control panel with two modes:
 - **Route**: build a path of numbered stops, then drive it. Set a
   **speed** (mph) and a repeat mode (**once / loop / bounce**, same
   meanings as [`gpsspoof route`](#gpsspoof-route-waypoints)), then press
-  **▶ Drive**; the marker follows the device live as it moves. The same
+  **▶ Drive**; the position marker (a white car) follows the device live,
+  pointing in the direction of travel. The same
   button becomes **⏹ Stop** while running (press to end and hold). **⏸
   Pause** freezes the dot in place and becomes **▶ Resume** to continue.
   The panel shows the route's **length** (miles) and the
