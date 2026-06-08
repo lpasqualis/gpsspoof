@@ -225,12 +225,13 @@ Besides the numbered entries, you can type at the `>` prompt:
 - a raw coordinate pair (e.g. `47.490308, -122.205647`) to spoof an
   arbitrary point that isn't in the list; or
 - a route to drive — waypoints separated by `>` (or `->`) with an
-  optional trailing `@ speed` in mph, e.g.
-  `kent > seattle > redmond @ 30` or
-  `47.5,-122.2 > 47.49,-122.2 @ 25`. Each waypoint may be a name or a
-  `lat,lon` pair. The route plays once and then waits at the final
-  waypoint for a keypress (Ctrl-C while it's still moving quits the UI).
-  See [`gpsspoof route`](#gpsspoof-route-waypoints) for the full command.
+  optional trailing `@ speed` in mph and an optional `loop` or `bounce`
+  keyword, e.g. `kent > seattle > redmond @ 30`,
+  `kent > seattle > redmond @ 30 bounce`, or
+  `47.5,-122.2 > 47.49,-122.2 @ 25 loop`. Each waypoint may be a name or
+  a `lat,lon` pair. A single pass waits at the final waypoint for a
+  keypress; `loop`/`bounce` run until Ctrl-C (Ctrl-C while moving quits
+  the UI). See [`gpsspoof route`](#gpsspoof-route-waypoints) for details.
 
 ### `gpsspoof list`
 
@@ -293,13 +294,20 @@ sudo gpsspoof route kent "47.49, -122.20" redmond --speed 25
 `--speed` is a bare number in **miles per hour** by default; add a unit
 suffix to change that (`30mph`, `48km/h`, `13m/s`). Default is 30 mph.
 
-By default the route runs once and then **holds at the final waypoint**
-until you press Ctrl-C (which clears and restores real GPS). Pass
-`--loop` to drive the route on repeat (start → end → start → …) until
-Ctrl-C:
+**What happens at the end of the route** depends on the repeat mode:
+
+| Mode | Flag | Path |
+|------|------|------|
+| once (default) | *(none)* | A → B → C → D → E, then **hold** at E until Ctrl-C |
+| loop | `--loop` | A → B → C → D → E → A → B → … (drives the closing E → A leg, a full lap) repeated until Ctrl-C |
+| bounce | `--bounce` | A → B → C → D → E → D → C → B → A → B → … (reverses at each end) repeated until Ctrl-C |
+
+`--loop` and `--bounce` are mutually exclusive. In every mode, Ctrl-C
+clears the device and restores real GPS.
 
 ```bash
-sudo gpsspoof route kent seattle redmond --speed 45 --loop
+sudo gpsspoof route kent seattle redmond --speed 45 --loop     # laps
+sudo gpsspoof route kent seattle redmond --speed 45 --bounce   # there and back
 ```
 
 ```text

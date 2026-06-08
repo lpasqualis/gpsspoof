@@ -313,22 +313,30 @@ def resolve_waypoints(
 
 def parse_route_line(
     line: str, locations: dict
-) -> tuple[list[tuple[str, float, float]], float]:
-    """Parse an interactive route line into (waypoints, speed_mps).
+) -> tuple[list[tuple[str, float, float]], float, str]:
+    """Parse an interactive route line into (waypoints, speed_mps, repeat).
 
-    Format: ``WP > WP [> WP ...] [@ SPEED]`` where each WP is a name or a
-    "lat,lon" pair, waypoints are separated by ``>`` or ``->``, and the
-    optional trailing ``@ SPEED`` overrides the default speed (mph). e.g.::
+    Format: ``WP > WP [> WP ...] [@ SPEED] [loop|bounce]`` where each WP is a
+    name or a "lat,lon" pair, waypoints are separated by ``>`` or ``->``, the
+    optional ``@ SPEED`` overrides the default speed (mph), and an optional
+    trailing ``loop`` or ``bounce`` keyword sets the repeat mode (default is
+    a single pass). e.g.::
 
         kent > seattle > redmond @ 30
         47.5,-122.2 -> 47.49,-122.2 @ 48km/h
+        kent > seattle > redmond @ 30 bounce
     """
+    repeat = "once"
+    m = re.search(r"\s+(loop|bounce)\s*$", line, re.IGNORECASE)
+    if m:
+        repeat = m.group(1).lower()
+        line = line[:m.start()]
     speed_mps = DEFAULT_ROUTE_SPEED_MPH * MPH_TO_MPS
     if "@" in line:
         line, _, speed_str = line.rpartition("@")
         speed_mps = parse_speed(speed_str)
     tokens = [t.strip() for t in re.split(r"->|>", line) if t.strip()]
-    return resolve_waypoints(tokens, locations), speed_mps
+    return resolve_waypoints(tokens, locations), speed_mps, repeat
 
 
 async def list_iphones() -> list[dict]:
@@ -550,6 +558,23 @@ def route_total_m(points: list[tuple[str, float, float]]) -> float:
     )
 
 
+def route_pass_m(points: list[tuple[str, float, float]], repeat: str) -> float:
+    """Distance of one repeat unit ("pass") for the given repeat mode.
+
+    once   -> first to last (the plain route)
+    loop   -> first to last plus the closing last->first leg (a full lap)
+    bounce -> there and back, i.e. twice the route
+    """
+    base = route_total_m(points)
+    if repeat == "loop":
+        return base + haversine_m(
+            points[-1][1], points[-1][2], points[0][1], points[0][2]
+        )
+    if repeat == "bounce":
+        return base * 2
+    return base
+
+
 def _print_route_progress(
     seg_idx: int, n_segs: int, dest_name: str,
     lat: float, lon: float, travelled_m: float, total_m: float, speed_mps: float,
@@ -604,6 +629,33 @@ async def drive_route(
                 break
             await asyncio.sleep(tick)
         done_m += seg_m
+
+
+async def drive_repeated(
+    sim, points: list[tuple[str, float, float]], speed_mps: float, repeat: str,
+) -> None:
+    """Drive `points` according to `repeat`.
+
+    once   -> a single forward pass, then return.
+    loop   -> forward, then drive the closing last->first leg, forever
+              (A->B->C->D->E->A->B->...), so the dot travels a closed circuit.
+    bounce -> forward then reverse, forever
+              (A->B->C->D->E->D->C->B->A->B->...), reversing at each end.
+
+    `loop` and `bounce` never return on their own; the caller stops them by
+    cancelling this coroutine.
+    """
+    if repeat == "loop":
+        cycle = points + [points[0]]  # close the lap by driving last->first
+        while True:
+            await drive_route(sim, cycle, speed_mps)
+    elif repeat == "bounce":
+        reverse = list(reversed(points))
+        while True:
+            await drive_route(sim, points, speed_mps)
+            await drive_route(sim, reverse, speed_mps)
+    else:  # once
+        await drive_route(sim, points, speed_mps)
 
 
 def cmd_list(_args: argparse.Namespace) -> int:
@@ -790,13 +842,16 @@ async def cmd_route(args: argparse.Namespace) -> int:
     )
 
     route_label = " -> ".join(p[0] for p in points)
-    total_m = route_total_m(points)
-    eta_s = int(total_m / speed_mps) if speed_mps > 0 else 0
+    pass_m = route_pass_m(points, args.repeat)
+    eta_s = int(pass_m / speed_mps) if speed_mps > 0 else 0
+    mode_note = {"loop": "  (looping)", "bounce": "  (bouncing)"}.get(
+        args.repeat, ""
+    )
+    per = " per pass" if args.repeat != "once" else ""
     print()
     print(f"  route:  {route_label}")
-    print(f"  speed:  {speed_mps / MPH_TO_MPS:.1f} mph"
-          f"{'  (looping)' if args.loop else ''}")
-    print(f"  length: {total_m / 1609.344:.2f} mi  (~{eta_s}s per pass)")
+    print(f"  speed:  {speed_mps / MPH_TO_MPS:.1f} mph{mode_note}")
+    print(f"  length: {pass_m / 1609.344:.2f} mi  (~{eta_s}s{per})")
     print()
     print("  press Ctrl-C to clear and exit")
     print()
@@ -821,13 +876,9 @@ async def cmd_route(args: argparse.Namespace) -> int:
                 except NotImplementedError:
                     pass
 
-            async def _run() -> None:
-                while True:
-                    await drive_route(sim, points, speed_mps)
-                    if not args.loop:
-                        return
-
-            run_task = asyncio.create_task(_run())
+            run_task = asyncio.create_task(
+                drive_repeated(sim, points, speed_mps, args.repeat)
+            )
             stop_task = asyncio.create_task(stop.wait())
             try:
                 await asyncio.wait(
@@ -838,8 +889,8 @@ async def cmd_route(args: argparse.Namespace) -> int:
                     if exc is not None:
                         raise exc
                     if not stop.is_set():
-                        # Reached the end and not looping: hold here until the
-                        # user stops us, mirroring `set`.
+                        # Only `once` completes on its own: hold at the final
+                        # waypoint until the user stops us, mirroring `set`.
                         print(f"\n  arrived at {points[-1][0]}; holding. "
                               f"Ctrl-C to clear and exit.")
                         await stop.wait()
@@ -949,7 +1000,7 @@ async def _menu_prompt(locations: dict) -> Optional[dict]:
         print(f"  {ANSI['dim']}...or a coordinate pair: "
               f"47.490308, -122.205647{ANSI['reset']}")
         print(f"  {ANSI['dim']}...or a route to drive: "
-              f"kent > seattle > redmond @ 30{ANSI['reset']}")
+              f"kent > seattle > redmond @ 30 [loop|bounce]{ANSI['reset']}")
         print()
         try:
             raw = await asyncio.get_event_loop().run_in_executor(
@@ -971,11 +1022,12 @@ async def _menu_prompt(locations: dict) -> Optional[dict]:
             continue
         if ">" in choice:
             try:
-                points, speed = parse_route_line(choice, locations)
+                points, speed, repeat = parse_route_line(choice, locations)
             except ValueError as e:
                 print(f"  {ANSI['yellow']}{e}{ANSI['reset']}")
                 continue
-            return {"kind": "route", "points": points, "speed": speed}
+            return {"kind": "route", "points": points, "speed": speed,
+                    "repeat": repeat}
         try:
             coords = parse_coords(choice)
         except ValueError as e:
@@ -1121,21 +1173,25 @@ async def _interactive_session(
 
 
 async def _interactive_route(
-    iphone: dict, points: list[tuple[str, float, float]], speed_mps: float
+    iphone: dict, points: list[tuple[str, float, float]], speed_mps: float,
+    repeat: str = "once",
 ) -> bool:
     """Drive a route in the UI, hold at the end, clear on key/Ctrl-C.
 
     Returns True to quit the whole UI (Ctrl-C), False to return to the menu.
-    Ctrl-C while the route is still moving aborts and quits the UI.
+    For a single pass, any key after arrival returns to the menu. For `loop`
+    or `bounce` the route runs until Ctrl-C, which quits the UI (as does
+    Ctrl-C while a single pass is still moving).
     """
     route_label = " -> ".join(p[0] for p in points)
-    total_m = route_total_m(points)
-    eta_s = int(total_m / speed_mps) if speed_mps > 0 else 0
+    pass_m = route_pass_m(points, repeat)
+    eta_s = int(pass_m / speed_mps) if speed_mps > 0 else 0
+    mode_note = {"loop": ", looping", "bounce": ", bouncing"}.get(repeat, "")
 
     print()
     print(f"{ANSI['bold']}→ driving:{ANSI['reset']} {route_label}")
     print(f"  {ANSI['dim']}{speed_mps / MPH_TO_MPS:.0f} mph, "
-          f"{total_m / 1609.344:.2f} mi, ~{eta_s}s{ANSI['reset']}")
+          f"{pass_m / 1609.344:.2f} mi, ~{eta_s}s{mode_note}{ANSI['reset']}")
 
     from pymobiledevice3.services.dvt.instruments.location_simulation import (
         LocationSimulation,
@@ -1154,13 +1210,19 @@ async def _interactive_route(
                 "pid": os.getpid(),
             })
             try:
-                await drive_route(sim, points, speed_mps)
-                print(f"\n  {ANSI['green']}arrived at {points[-1][0]}"
-                      f"{ANSI['reset']}")
-                print(f"  {ANSI['dim']}press any key to clear and return to "
-                      f"menu  (Ctrl-C to quit){ANSI['reset']}")
-                result = await _wait_for_key_with_ticker(started)
-                quit_app = result == "quit"
+                if repeat == "once":
+                    await drive_route(sim, points, speed_mps)
+                    print(f"\n  {ANSI['green']}arrived at {points[-1][0]}"
+                          f"{ANSI['reset']}")
+                    print(f"  {ANSI['dim']}press any key to clear and return "
+                          f"to menu  (Ctrl-C to quit){ANSI['reset']}")
+                    result = await _wait_for_key_with_ticker(started)
+                    quit_app = result == "quit"
+                else:
+                    print(f"  {ANSI['dim']}Ctrl-C to clear and quit"
+                          f"{ANSI['reset']}")
+                    # Runs until Ctrl-C raises KeyboardInterrupt here.
+                    await drive_repeated(sim, points, speed_mps, repeat)
             finally:
                 print(f"  {ANSI['dim']}clearing...{ANSI['reset']}")
                 try:
@@ -1209,7 +1271,8 @@ async def cmd_ui(args: argparse.Namespace) -> int:
             try:
                 if choice["kind"] == "route":
                     done = await _interactive_route(
-                        iphone, choice["points"], choice["speed"]
+                        iphone, choice["points"], choice["speed"],
+                        choice["repeat"]
                     )
                 else:
                     done = await _interactive_session(
@@ -1265,6 +1328,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  gpsspoof set seattle              # start spoofing (Ctrl-C to stop)\n"
             "  gpsspoof set 47.490308 -122.205647   # spoof to raw coordinates\n"
             "  gpsspoof route kent seattle redmond --speed 30   # drive a route\n"
+            "  gpsspoof route kent seattle redmond --bounce     # there-and-back\n"
             "  gpsspoof clear                    # stop any active spoof\n"
             "  gpsspoof status                   # show current state\n"
             "  gpsspoof add airport 47.4502 -122.3088\n"
@@ -1316,10 +1380,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="travel speed; a bare number is mph (default %(default)s). "
              "Units allowed: e.g. 30mph, 48km/h, 13m/s.",
     )
-    p_route.add_argument(
+    p_route.set_defaults(repeat="once")
+    repeat_mode = p_route.add_mutually_exclusive_group()
+    repeat_mode.add_argument(
         "--loop",
-        action="store_true",
-        help="repeat the route from the start until Ctrl-C",
+        dest="repeat", action="store_const", const="loop",
+        help="repeat as a closed loop (...last -> first -> second...) "
+             "until Ctrl-C",
+    )
+    repeat_mode.add_argument(
+        "--bounce",
+        dest="repeat", action="store_const", const="bounce",
+        help="repeat back and forth, reversing at each end "
+             "(...second-last -> last -> second-last...) until Ctrl-C",
     )
 
     sub.add_parser("clear", help="stop any active spoof on the device (needs sudo or tunneld)")
