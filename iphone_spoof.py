@@ -1439,7 +1439,8 @@ async def cmd_ui(args: argparse.Namespace) -> int:
     return 0
 
 
-CAR_DISPLAY_MAX_PX = 48   # longest side of the position-marker car icon
+CAR_DISPLAY_MAX_PX = 48     # longest side of the position-marker car icon
+BADGE_DISPLAY_MAX_PX = 40   # longest side of the walking / standing badges
 # Used only if assets/Corvette.png can't be read; points north (nose up).
 CAR_FALLBACK_SVG = (
     '<svg width="36" height="36" viewBox="0 0 36 36">'
@@ -1464,30 +1465,38 @@ def _png_size(data: bytes) -> Optional[tuple[int, int]]:
     return None
 
 
-def car_icon_html() -> tuple[str, str, str]:
-    """Build the car marker's (inner HTML, iconSize, iconAnchor) for the page.
+def _img_icon_html(filename: str, max_px: int,
+                   fallback: tuple[str, str, str] | None = None) -> tuple[str, str, str]:
+    """Build a marker's (inner HTML, iconSize, iconAnchor) from assets/<filename>.
 
-    Embeds assets/Corvette.png as a base64 data-URI (kept aspect-correct,
-    longest side CAR_DISPLAY_MAX_PX); falls back to a built-in SVG car if the
-    image can't be read. The returned size/anchor strings are JS array
-    literals for the Leaflet divIcon.
+    Embeds the PNG as a base64 data-URI (kept aspect-correct, longest side max_px);
+    returns `fallback` (or an empty glyph) if the image can't be read. The size/anchor
+    strings are JS array literals for the Leaflet divIcon.
     """
-    path = Path(__file__).resolve().parent / "assets" / "Corvette.png"
+    path = Path(__file__).resolve().parent / "assets" / filename
     try:
         data = path.read_bytes()
         size = _png_size(data)
         if size:
             w, h = size
-            scale = CAR_DISPLAY_MAX_PX / max(w, h)
+            scale = max_px / max(w, h)
             dw, dh = round(w * scale), round(h * scale)
         else:
-            dw = dh = CAR_DISPLAY_MAX_PX
+            dw = dh = max_px
         b64 = base64.b64encode(data).decode("ascii")
         img = (f'<img src="data:image/png;base64,{b64}" '
                f'width="{dw}" height="{dh}"/>')
         return img, f"[{dw}, {dh}]", f"[{dw / 2}, {dh / 2}]"
     except OSError:
-        return CAR_FALLBACK_SVG, "[36, 36]", "[18, 18]"
+        if fallback:
+            return fallback
+        return "", f"[{max_px}, {max_px}]", f"[{max_px / 2}, {max_px / 2}]"
+
+
+def car_icon_html() -> tuple[str, str, str]:
+    """The car marker glyph (assets/Corvette.png; SVG car fallback)."""
+    return _img_icon_html("Corvette.png", CAR_DISPLAY_MAX_PX,
+                          (CAR_FALLBACK_SVG, "[36, 36]", "[18, 18]"))
 
 
 # Single-page Leaflet map served by `gpsspoof map`. The __LAT__/__LON__/
@@ -1601,13 +1610,35 @@ MAP_HTML = """<!DOCTYPE html>
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
 
-  const carIcon = L.divIcon({ className: 'car-icon', html: '<div class="car">__CAR_IMG__</div>', iconSize: __CAR_SIZE__, iconAnchor: __CAR_ANCHOR__ });
-  const device = L.marker([initial.lat, initial.lon], { draggable: true, icon: carIcon }).addTo(map);
-  function carEl() { const e = device.getElement(); return e ? e.querySelector('.car') : null; }
-  let carHeading = 0;
-  function rotateCar(deg) {           // deg = target bearing (0-360); keep carHeading CONTINUOUS so a
-    carHeading += ((deg - carHeading) % 360 + 540) % 360 - 180;   // north crossing turns the short way
-    const el = carEl(); if (el) el.style.transform = 'rotate(' + carHeading + 'deg)';   // (no wild spin)
+  // Position marker: a car when driving, a (direction-facing) walker when moving slowly, a standing
+  // figure when not moving. All three share the rotatable/flippable '.car' wrapper.
+  const ICONS = {
+    car:   L.divIcon({ className: 'car-icon', html: '<div class="car">__CAR_IMG__</div>',   iconSize: __CAR_SIZE__,   iconAnchor: __CAR_ANCHOR__ }),
+    walk:  L.divIcon({ className: 'car-icon', html: '<div class="car">__WALK_IMG__</div>',  iconSize: __WALK_SIZE__,  iconAnchor: __WALK_ANCHOR__ }),
+    stand: L.divIcon({ className: 'car-icon', html: '<div class="car">__STAND_IMG__</div>', iconSize: __STAND_SIZE__, iconAnchor: __STAND_ANCHOR__ }),
+  };
+  const device = L.marker([initial.lat, initial.lon], { draggable: true, icon: ICONS.stand }).addTo(map);
+  function glyphEl() { const e = device.getElement(); return e ? e.querySelector('.car') : null; }
+  let carHeading = 0, youKind = 'stand', youFace = 'R';
+  const MOVE_MIN_M = 1, DRIVE_MIN_M = 4;   // per ~1s poll: < move = standing, >= drive = car, else walking
+  function applyGlyph() {                   // car rotates to heading; walker flips to face travel; stand upright
+    const el = glyphEl(); if (!el) return;
+    el.style.transform = (youKind === 'car') ? ('rotate(' + carHeading + 'deg)')
+                       : (youKind === 'walk' && youFace === 'L') ? 'scaleX(-1)' : 'none';
+  }
+  function setKind(kind) { if (kind !== youKind) { youKind = kind; device.setIcon(ICONS[kind]); } applyGlyph(); }
+  function updateMarker(np) {               // pick standing/walking/driving from movement since last fix
+    if (lastCarPos) {
+      const d = haversineM(lastCarPos, np);
+      if (d < MOVE_MIN_M) { setKind('stand'); }   // not moving -> standing; keep last heading
+      else {
+        const b = bearing(lastCarPos, np);
+        carHeading += ((b - carHeading) % 360 + 540) % 360 - 180;   // turn the short way (no wild spin)
+        youFace = (b > 180) ? 'L' : 'R';          // heading west -> mirror the walker to face left
+        setKind(d >= DRIVE_MIN_M ? 'car' : 'walk');
+      }
+    }
+    lastCarPos = np;
   }
   function bearing(a, b) {
     const rad = Math.PI / 180, deg = 180 / Math.PI;
@@ -1683,6 +1714,7 @@ MAP_HTML = """<!DOCTYPE html>
 
   async function teleport(lat, lon) {
     lastCarPos = { lat: lat, lon: lon };   // so the next drive heads correctly
+    setKind('stand');                      // a set point isn't moving -> standing
     show('sending: ' + fmt(lat, lon), 'pending');
     try { await post('/set', { lat: lat, lon: lon }); show('spoofing: ' + fmt(lat, lon), 'ok'); }
     catch (e) { show('error: ' + e.message, 'err'); }
@@ -1928,14 +1960,14 @@ MAP_HTML = """<!DOCTYPE html>
       updateTransport(st.driving, !!st.paused);
       if (st.driving) {
         if (!wasDriving) lastCarPos = null;       // fresh heading at drive start
-        const np = { lat: st.lat, lon: st.lon };
-        if (lastCarPos && haversineM(lastCarPos, np) > 1) rotateCar(bearing(lastCarPos, np));
-        lastCarPos = np;
+        updateMarker({ lat: st.lat, lon: st.lon });   // standing / walking / driving + heading
         device.setLatLng([st.lat, st.lon]);
         if (document.getElementById('follow').checked) map.panTo([st.lat, st.lon]);
         show((st.paused ? 'paused: ' : 'driving: ') + fmt(st.lat, st.lon),
           st.paused ? 'pending' : 'ok');
-      } else if (wasDriving) {
+      } else if (wasDriving) {                    // just stopped -> hold position, standing
+        lastCarPos = { lat: st.lat, lon: st.lon };
+        setKind('stand');
         device.setLatLng([st.lat, st.lon]);
         show('spoofing: ' + fmt(st.lat, st.lon), 'ok');
       }
@@ -2155,6 +2187,8 @@ async def cmd_map(args: argparse.Namespace) -> int:
     else:
         center_lat, center_lon = MAP_DEFAULT_CENTER
     car_img, car_size, car_anchor = car_icon_html()
+    walk_img, walk_size, walk_anchor = _img_icon_html("walking.png", BADGE_DISPLAY_MAX_PX)
+    stand_img, stand_size, stand_anchor = _img_icon_html("standing.png", BADGE_DISPLAY_MAX_PX)
     html = (MAP_HTML
             .replace("__LAT__", repr(center_lat))
             .replace("__LON__", repr(center_lon))
@@ -2162,7 +2196,13 @@ async def cmd_map(args: argparse.Namespace) -> int:
             .replace("__ACTIVE__", "false")
             .replace("__CAR_SIZE__", car_size)
             .replace("__CAR_ANCHOR__", car_anchor)
-            .replace("__CAR_IMG__", car_img))
+            .replace("__CAR_IMG__", car_img)
+            .replace("__WALK_SIZE__", walk_size)
+            .replace("__WALK_ANCHOR__", walk_anchor)
+            .replace("__WALK_IMG__", walk_img)
+            .replace("__STAND_SIZE__", stand_size)
+            .replace("__STAND_ANCHOR__", stand_anchor)
+            .replace("__STAND_IMG__", stand_img))
 
     async with open_dvt(iphone["udid"]) as dvt:
         async with LocationSimulation(dvt) as sim:
