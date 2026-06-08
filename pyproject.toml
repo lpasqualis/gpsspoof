@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Lorenzo Pasqualis" }]
 dependencies = [
-    "pymobiledevice3>=4.10",
+    "pymobiledevice3>=9.0",
 ]
 
 [project.scripts]

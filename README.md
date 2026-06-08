@@ -30,6 +30,15 @@ udid:      00008030-0123456789ABCDEF
 ... cleared. real GPS resumed.
 ```
 
+**Use it for:** testing location-aware apps, geofencing, and navigation;
+demos and QA; or simply moving the blue dot — including driving a
+believable route — on a device you own.
+
+> **Intended use.** Spoof only an iPhone you own and control. Faking your
+> location to deceive online services, defeat anti-cheat, or commit fraud
+> may violate their terms or the law. Use it responsibly and only where
+> you're authorized.
+
 ---
 
 ## Contents
@@ -850,4 +859,4 @@ device appears exactly once.
 
 ## License
 
-MIT (see `pyproject.toml`).
+MIT — see [LICENSE](LICENSE).
