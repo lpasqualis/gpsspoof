@@ -130,10 +130,11 @@ REALISM_SPEED_VARIATION = 0.08  # cruise speed wanders this fraction around targ
 REALISM_SPEED_TAU_S = 5.0      # how slowly the cruise speed drifts
 REALISM_CORNER_EXP = 2.3       # turn-sharpness -> slowdown curve (bigger = sharper drop)
 REALISM_CORNER_MIN = 0.12      # never slow below this fraction of cruise in a turn
-REALISM_JITTER_M = 2.5         # baseline GPS scatter (meters, ~1 sigma)
-REALISM_JITTER_MAX_M = 8.0     # worst-case scatter when "accuracy" degrades
+REALISM_JITTER_M = 2.5         # baseline GPS accuracy radius (meters)
+REALISM_JITTER_MAX_M = 8.0     # worst-case accuracy radius when it degrades
 REALISM_JITTER_TAU_S = 2.5     # how quickly the scatter wanders (position noise)
-REALISM_ACCURACY_TAU_S = 20.0  # how slowly the scatter radius itself drifts
+REALISM_ACCURACY_TAU_S = 20.0  # how slowly the accuracy radius itself drifts
+REALISM_JITTER_SHAPE = 0.5     # per-axis noise as a fraction of the accuracy radius
 
 # `map` server: where to center the browser map when there's no prior fix.
 MAP_DEFAULT_CENTER = (47.6062, -122.3321)  # Seattle
@@ -849,20 +850,30 @@ class MotionState:
         return self.v
 
     def jitter_offset(self, lat: float, dt: float) -> tuple[float, float]:
-        """Correlated GPS noise to add to the reported fix, as (dlat, dlon).
+        """Correlated GPS noise to add to the *clean* fix, as (dlat, dlon).
 
-        The scatter radius `sigma` drifts slowly between the baseline and
-        worst-case values (a varying "accuracy"); the east/north offsets are
-        their own mean-reverting walks at that radius. Continues even at a
-        standstill, so the dot wanders at rest like a real one.
+        The caller adds this to the true path point each tick (never to the
+        previous jittered fix), so the noise can't accumulate or walk the dot
+        off course. `sigma` is the current accuracy radius, drifting slowly
+        between the baseline and worst-case values (a varying "accuracy"); the
+        east/north offsets are mean-reverting walks within it, and the combined
+        offset is hard-bounded to `sigma` so the dot never strays farther from
+        the true path than the reported accuracy — no wild excursions. Continues
+        even at a standstill, so the dot wanders at rest like a real one.
         """
         mid = (self.jitter_m + self.jitter_max_m) / 2.0
         amp = (self.jitter_max_m - self.jitter_m) / 2.0
         self.sigma = min(self.jitter_max_m, max(
             self.jitter_m,
             self._ou_step(self.sigma, mid, REALISM_ACCURACY_TAU_S, amp, dt)))
-        self.jx = self._ou_step(self.jx, 0.0, REALISM_JITTER_TAU_S, self.sigma, dt)
-        self.jy = self._ou_step(self.jy, 0.0, REALISM_JITTER_TAU_S, self.sigma, dt)
+        std = self.sigma * REALISM_JITTER_SHAPE
+        self.jx = self._ou_step(self.jx, 0.0, REALISM_JITTER_TAU_S, std, dt)
+        self.jy = self._ou_step(self.jy, 0.0, REALISM_JITTER_TAU_S, std, dt)
+        # Bound the 2D offset to the accuracy radius (clamp the rare long tail).
+        r = math.hypot(self.jx, self.jy)
+        if r > self.sigma:
+            self.jx *= self.sigma / r
+            self.jy *= self.sigma / r
         dlat = self.jy / 111320.0
         dlon = self.jx / (111320.0 * math.cos(math.radians(lat)) or 1e-6)
         return dlat, dlon
@@ -970,6 +981,8 @@ async def drive_route(
             lat = lat0 + (lat1 - lat0) * frac
             lon = lon0 + (lon1 - lon0) * frac
             if motion is not None:
+                # Jitter is added to the clean path point (lat/lon), never to
+                # the previous reported fix, so it can't accumulate or drift.
                 dlat, dlon = motion.jitter_offset(lat, dt)
                 rlat, rlon = lat + dlat, lon + dlon
                 await sim.set(rlat, rlon)

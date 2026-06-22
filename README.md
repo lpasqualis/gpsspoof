@@ -309,8 +309,9 @@ The page has a small control panel with two modes:
   four knobs (the **speed** field stays the cruise target):
     - **vary ±__%** — how far the cruise speed wanders above/below the target;
     - **accel __ g** / **brake __ g** — the acceleration and braking limits;
-    - **jitter __–__ m** — the GPS scatter range (its low–high bounds; the
-      radius drifts within them, standing in for a varying accuracy).
+    - **jitter __–__ m** — the GPS accuracy radius (the low–high bounds it
+      drifts between); the dot stays within this many meters of the true path,
+      standing in for a varying accuracy. Set both to 0 to disable jitter.
 
   While a natural drive runs, a live readout under the route info shows the
   **current speed** (mph) and **current acceleration** in **g** (positive

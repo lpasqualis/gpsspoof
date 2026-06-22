@@ -58,7 +58,9 @@ unlocked. When no device is attached, device commands fail fast with
   to a stop on `once` arrival via `stop_at_end`), and adds drifting GPS
   jitter. State persists across segments/passes so motion is continuous.
   The protocol sends only lat/lon — `horizontalAccuracy` isn't settable —
-  so jitter stands in for variable accuracy. The key tunables
+  so jitter stands in for variable accuracy (added to the clean path point,
+  never the previous fix, and bounded to the current accuracy radius, so it
+  can't accumulate). The key tunables
   (speed_variation, accel_max, decel_max, jitter_m, jitter_max_m) are
   `MotionState` constructor args defaulting to the module-level `REALISM_*`
   constants; the map UI overrides them per drive (knobs revealed by the
