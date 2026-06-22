@@ -51,6 +51,16 @@ unlocked. When no device is attached, device commands fail fast with
   distance from real elapsed time × the current speed; `_update_interval`
   paces updates adaptively (~100 ft/step, clamped to 0.1–1.0 s);
   `drive_repeated` adds once/loop/bounce.
+- Realistic motion (opt-in): pass a `MotionState` into `drive_route`/
+  `drive_repeated` (`route --realistic`, map "natural motion" checkbox, or
+  the `natural` keyword in `ui`). It makes the commanded speed a wandering
+  cruise target, accel/decel-limits every change, brakes for corners (and
+  to a stop on `once` arrival via `stop_at_end`), and adds drifting GPS
+  jitter. State persists across segments/passes so motion is continuous.
+  The protocol sends only lat/lon — `horizontalAccuracy` isn't settable —
+  so jitter stands in for variable accuracy; tunables are the module-level
+  `REALISM_*` constants. In realistic mode `on_update`/`/state` also carry
+  the clean `course`+`speed` so the map marker doesn't spin from jitter.
 - Map server: `cmd_map` runs a stdlib `ThreadingHTTPServer` alongside the
   asyncio `LocationSimulation`; `_MapRequestHandler` bridges HTTP →
   asyncio via `run_coroutine_threadsafe`. The served page is the

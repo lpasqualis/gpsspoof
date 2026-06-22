@@ -45,6 +45,17 @@ integrates distance from real elapsed time × the current speed and paces
 updates adaptively (see `_update_interval`). Named routes persist to
 `~/.config/iphone-spoof/routes.json` (shared by the CLI and the map).
 
+Opt-in "realistic" motion (`route --realistic`, the map's "natural motion"
+checkbox, or a `natural` keyword in the interactive `ui`) layers human-like
+driving over that exact path via `MotionState`: the commanded speed becomes a
+cruise target that wanders within a band, real acceleration/deceleration limits
+smooth every change, the car brakes for upcoming corners and rolls to a stop on
+arrival, and the reported fix carries drifting GPS jitter. The protocol only
+transmits latitude/longitude — iOS synthesizes the `horizontalAccuracy` reading
+itself, so it can't be set — but the jitter reproduces the *effect* of a
+variable accuracy, and iOS derives the reported speed/course from the fixes, so
+those look natural too.
+
 The active spoof session is mirrored to `~/.config/iphone-spoof/state.json`
 purely so `gpsspoof status` can describe what's running. The state file is
 removed on clean exit; if the `set` process is killed with `kill -9`, the
@@ -60,6 +71,7 @@ import base64
 import json
 import math
 import os
+import random
 import re
 import signal
 import sys
@@ -102,6 +114,26 @@ DEFAULT_ROUTE_SPEED_MPH = 30.0
 ROUTE_TICK_S = 1.0
 GPS_STEP_TARGET_M = 30.48   # ~100 feet: target distance moved per update
 GPS_MIN_INTERVAL_S = 0.1    # at most ~10 updates/sec
+
+# --- Realistic motion (opt-in: `route --realistic`, map "natural" toggle) ----
+# Layers human-like driving and GPS noise over the exact path. The protocol can
+# only send latitude/longitude (iOS synthesizes horizontalAccuracy itself, so
+# the accuracy *number* isn't settable), but the *effect* of variable accuracy
+# is reproduced as drifting positional jitter. There is one master toggle and
+# no per-run knobs; these baked-in defaults are tuned to look natural without
+# being distracting. Speeds are m/s, accelerations m/s^2, distances/jitter
+# meters, correlation times seconds.
+REALISM_ACCEL_MAX = 2.0        # comfortable acceleration
+REALISM_DECEL_MAX = 3.0        # comfortable braking (harder than accel)
+REALISM_RATE_JITTER = 0.30     # +/- variance applied to each tick's accel/decel
+REALISM_SPEED_VARIATION = 0.08  # cruise speed wanders this fraction around target
+REALISM_SPEED_TAU_S = 5.0      # how slowly the cruise speed drifts
+REALISM_CORNER_EXP = 2.3       # turn-sharpness -> slowdown curve (bigger = sharper drop)
+REALISM_CORNER_MIN = 0.12      # never slow below this fraction of cruise in a turn
+REALISM_JITTER_M = 2.5         # baseline GPS scatter (meters, ~1 sigma)
+REALISM_JITTER_MAX_M = 8.0     # worst-case scatter when "accuracy" degrades
+REALISM_JITTER_TAU_S = 2.5     # how quickly the scatter wanders (position noise)
+REALISM_ACCURACY_TAU_S = 20.0  # how slowly the scatter radius itself drifts
 
 # `map` server: where to center the browser map when there's no prior fix.
 MAP_DEFAULT_CENTER = (47.6062, -122.3321)  # Seattle
@@ -381,19 +413,23 @@ def resolve_waypoints(
 
 def parse_route_line(
     line: str, locations: dict
-) -> tuple[list[tuple[str, float, float]], float, str]:
-    """Parse an interactive route line into (waypoints, speed_mps, repeat).
+) -> tuple[list[tuple[str, float, float]], float, str, bool]:
+    """Parse a route line into (waypoints, speed_mps, repeat, realistic).
 
-    Format: ``WP > WP [> WP ...] [@ SPEED] [loop|bounce]`` where each WP is a
-    name or a "lat,lon" pair, waypoints are separated by ``>`` or ``->``, the
-    optional ``@ SPEED`` overrides the default speed (mph), and an optional
-    trailing ``loop`` or ``bounce`` keyword sets the repeat mode (default is
-    a single pass). e.g.::
+    Format: ``WP > WP [> WP ...] [@ SPEED] [loop|bounce] [natural]`` where each
+    WP is a name or a "lat,lon" pair, waypoints are separated by ``>`` or
+    ``->``, the optional ``@ SPEED`` overrides the default speed (mph), an
+    optional ``loop`` or ``bounce`` keyword sets the repeat mode (default a
+    single pass), and an optional ``natural`` (or ``realistic``) keyword turns
+    on human-like motion + GPS jitter. e.g.::
 
         kent > seattle > redmond @ 30
         47.5,-122.2 -> 47.49,-122.2 @ 48km/h
         kent > seattle > redmond @ 30 bounce
+        kent > seattle > redmond @ 30 loop natural
     """
+    line, n = re.subn(r"\s+(realistic|natural)\b", "", line, flags=re.IGNORECASE)
+    realistic = bool(n)
     repeat = "once"
     m = re.search(r"\s+(loop|bounce)\s*$", line, re.IGNORECASE)
     if m:
@@ -404,7 +440,7 @@ def parse_route_line(
         line, _, speed_str = line.rpartition("@")
         speed_mps = parse_speed(speed_str)
     tokens = [t.strip() for t in re.split(r"->|>", line) if t.strip()]
-    return resolve_waypoints(tokens, locations), speed_mps, repeat
+    return resolve_waypoints(tokens, locations), speed_mps, repeat, realistic
 
 
 async def list_iphones() -> list[dict]:
@@ -674,9 +710,153 @@ def _update_interval(speed_mps: float) -> float:
     return min(ROUTE_TICK_S, max(GPS_MIN_INTERVAL_S, GPS_STEP_TARGET_M / speed_mps))
 
 
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial great-circle bearing from point 1 to point 2, in degrees [0,360)."""
+    la1, la2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(la2)
+    x = math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _corner_speed_factor(theta_rad: float) -> float:
+    """Fraction of cruise speed to carry through a corner of deflection `theta`.
+
+    `theta` is the heading change at the vertex (0 = straight through, pi = a
+    U-turn). 0 deg -> 1.0 (no slowing); ~90 deg -> ~0.45; 180 deg -> the floor.
+    """
+    return max(REALISM_CORNER_MIN,
+               math.cos(theta_rad / 2.0) ** REALISM_CORNER_EXP)
+
+
+class MotionState:
+    """Evolving kinematic + GPS-noise state for one realistic drive.
+
+    Created once per drive and threaded through `drive_route` /
+    `drive_repeated`, so the current speed and the (correlated) GPS jitter
+    persist across segments and repeated passes instead of resetting. All the
+    tunables live in the module-level REALISM_* constants.
+
+    The four behaviors:
+      * cruise_speed   - the commanded speed becomes a target that wanders
+        within a band (a mean-reverting random walk), so it never sits dead flat.
+      * corner_limited_speed - look ahead to upcoming turns and cap the target
+        so we brake (at most REALISM_DECEL_MAX) to a turn-appropriate speed in
+        time, then accelerate back out.
+      * ramp_to        - move the actual speed toward the target no faster than
+        the accel/decel limits (with per-tick variance), so speed never jumps.
+      * jitter_offset  - add slowly-drifting positional noise to the reported
+        fix; the noise radius itself wanders between the baseline and worst-case
+        scatter, which is how we simulate a variable GPS-accuracy reading.
+    """
+
+    def __init__(self, rng: Optional[random.Random] = None) -> None:
+        self.v = 0.0                  # current speed, m/s (starts from rest)
+        self.cruise_mult = 1.0        # wandering multiplier on the commanded speed
+        self.jx = 0.0                 # current east jitter offset, meters
+        self.jy = 0.0                 # current north jitter offset, meters
+        self.sigma = REALISM_JITTER_M  # current scatter radius, meters
+        self.rng = rng or random.Random()
+
+    def _ou_step(self, value: float, mean: float, tau: float,
+                 std: float, dt: float) -> float:
+        """One step of a mean-reverting (Ornstein-Uhlenbeck) random walk.
+
+        Pulls `value` toward `mean` with time constant `tau` while injecting
+        Gaussian noise scaled so the long-run standard deviation is ~`std`.
+        Correlated over time (unlike per-tick white noise), which is what makes
+        both the speed drift and the GPS scatter look natural rather than jittery.
+        """
+        if tau <= 0 or dt <= 0:
+            return mean
+        a = min(1.0, dt / tau)
+        return value + (mean - value) * a + self.rng.gauss(0.0, std) * math.sqrt(2.0 * a)
+
+    def cruise_speed(self, commanded: float, dt: float) -> float:
+        """The commanded speed nudged by the wandering cruise multiplier."""
+        if commanded <= 0:
+            return 0.0       # paused / idle: target a full stop
+        self.cruise_mult = self._ou_step(
+            self.cruise_mult, 1.0, REALISM_SPEED_TAU_S,
+            REALISM_SPEED_VARIATION, dt)
+        lo, hi = 1.0 - 2.5 * REALISM_SPEED_VARIATION, 1.0 + 2.5 * REALISM_SPEED_VARIATION
+        self.cruise_mult = min(hi, max(lo, self.cruise_mult))
+        return commanded * self.cruise_mult
+
+    def corner_limited_speed(self, cruise: float, cum: list[float],
+                             theta: list[float], seg_idx: int,
+                             travelled: float, stop_at_end: bool) -> float:
+        """Cap `cruise` so we can brake in time for any upcoming corner/stop.
+
+        Scans vertices ahead of the current position (cumulative distance
+        `cum[seg_idx] + travelled`) within braking range. For each, the max
+        speed we may travel now and still slow to its corner speed by then is
+        ``sqrt(v_corner^2 + 2*decel*d)``; the smallest such limit wins. The
+        final vertex is a stop when `stop_at_end` (a single pass arrives), else
+        velocity is handed off to the next pass (loop/bounce stay in motion).
+        """
+        if cruise <= 0:
+            return 0.0
+        last = len(cum) - 1
+        s_abs = cum[seg_idx] + travelled
+        decel = REALISM_DECEL_MAX
+        horizon = cruise * cruise / (2.0 * decel) + 5.0
+        v_target = cruise
+        for k in range(seg_idx + 1, len(cum)):
+            d = cum[k] - s_abs
+            if d <= 0.0:
+                continue
+            if d > horizon:
+                break
+            if k == last:
+                if not stop_at_end:
+                    continue
+                v_corner = 0.0
+            else:
+                v_corner = cruise * _corner_speed_factor(theta[k])
+            v_allow = math.sqrt(v_corner * v_corner + 2.0 * decel * d)
+            if v_allow < v_target:
+                v_target = v_allow
+        return v_target
+
+    def ramp_to(self, v_target: float, dt: float) -> float:
+        """Move the current speed toward `v_target`, accel/decel-limited."""
+        if dt <= 0:
+            return self.v
+        a = REALISM_ACCEL_MAX if v_target > self.v else REALISM_DECEL_MAX
+        a *= 1.0 + self.rng.uniform(-REALISM_RATE_JITTER, REALISM_RATE_JITTER)
+        dv = max(0.0, a) * dt
+        if v_target > self.v:
+            self.v = min(v_target, self.v + dv)
+        else:
+            self.v = max(v_target, self.v - dv)
+        self.v = max(0.0, self.v)
+        return self.v
+
+    def jitter_offset(self, lat: float, dt: float) -> tuple[float, float]:
+        """Correlated GPS noise to add to the reported fix, as (dlat, dlon).
+
+        The scatter radius `sigma` drifts slowly between the baseline and
+        worst-case values (a varying "accuracy"); the east/north offsets are
+        their own mean-reverting walks at that radius. Continues even at a
+        standstill, so the dot wanders at rest like a real one.
+        """
+        mid = (REALISM_JITTER_M + REALISM_JITTER_MAX_M) / 2.0
+        amp = (REALISM_JITTER_MAX_M - REALISM_JITTER_M) / 2.0
+        self.sigma = min(REALISM_JITTER_MAX_M, max(
+            REALISM_JITTER_M,
+            self._ou_step(self.sigma, mid, REALISM_ACCURACY_TAU_S, amp, dt)))
+        self.jx = self._ou_step(self.jx, 0.0, REALISM_JITTER_TAU_S, self.sigma, dt)
+        self.jy = self._ou_step(self.jy, 0.0, REALISM_JITTER_TAU_S, self.sigma, dt)
+        dlat = self.jy / 111320.0
+        dlon = self.jx / (111320.0 * math.cos(math.radians(lat)) or 1e-6)
+        return dlat, dlon
+
+
 async def drive_route(
     sim, points: list[tuple[str, float, float]], speed_mps: float,
     *, on_update=None, show_progress: bool = True, get_speed=None,
+    motion: Optional[MotionState] = None, stop_at_end: bool = True,
 ) -> None:
     """Move the simulated location along `points` at `speed_mps`.
 
@@ -687,15 +867,48 @@ async def drive_route(
     `_update_interval`) to stay smooth without flooding the device.
 
     `get_speed`, if given, is called each tick to read the live speed (m/s);
-    otherwise the fixed `speed_mps` is used. `on_update(lat, lon)` runs after
-    each device update (the map server uses it to follow the dot).
-    `show_progress` prints the in-place terminal progress line.
+    otherwise the fixed `speed_mps` is used. `on_update(lat, lon[, course,
+    speed])` runs after each device update (the map server uses it to follow the
+    dot); `course`/`speed` are only passed in realistic mode. `show_progress`
+    prints the in-place terminal progress line.
+
+    When `motion` is given the drive is "realistic": the commanded speed becomes
+    a cruise target that wanders within a band, real acceleration/deceleration
+    limits smooth every speed change, the car brakes for upcoming corners (and,
+    when `stop_at_end`, rolls to a stop at the final waypoint), and the reported
+    fix carries correlated GPS jitter. `motion` holds the velocity/noise state
+    so it survives across segments and repeated passes. When `motion` is None the
+    movement is exact (constant speed, no jitter) and `stop_at_end` is ignored.
 
     Returns once the final waypoint is reached, leaving the location set
     there (the caller decides whether to hold, loop, or clear).
     """
     total_m = route_total_m(points)
     n_segs = len(points) - 1
+
+    # Realistic mode precomputes route geometry once: cumulative distance to
+    # each vertex (for corner look-ahead), each segment's bearing (the reported
+    # heading), and the deflection angle at each interior vertex (how sharp the
+    # turn is -> how much to slow for it).
+    cum: list[float] = []
+    theta: list[float] = []
+    seg_bearing: list[float] = []
+    if motion is not None:
+        cum = [0.0]
+        for i in range(n_segs):
+            cum.append(cum[i] + haversine_m(
+                points[i][1], points[i][2],
+                points[i + 1][1], points[i + 1][2]))
+        seg_bearing = [
+            _bearing_deg(points[i][1], points[i][2],
+                         points[i + 1][1], points[i + 1][2])
+            for i in range(n_segs)
+        ]
+        theta = [0.0] * len(points)
+        for k in range(1, n_segs):
+            d = abs(seg_bearing[k] - seg_bearing[k - 1]) % 360.0
+            theta[k] = math.radians(min(d, 360.0 - d))
+
     done_m = 0.0
     for i in range(n_segs):
         _, lat0, lon0 = points[i]
@@ -705,18 +918,34 @@ async def drive_route(
         prev = time.monotonic()
         while True:
             now = time.monotonic()
-            spd = get_speed() if get_speed is not None else speed_mps
-            travelled += max(0.0, spd) * (now - prev)
+            dt = now - prev
             prev = now
+            if motion is not None:
+                base = get_speed() if get_speed is not None else speed_mps
+                cruise = motion.cruise_speed(max(0.0, base), dt)
+                v_target = motion.corner_limited_speed(
+                    cruise, cum, theta, i, travelled, stop_at_end)
+                spd = motion.ramp_to(v_target, dt)
+            else:
+                spd = get_speed() if get_speed is not None else speed_mps
+            travelled += max(0.0, spd) * dt
             frac = 1.0 if seg_m <= 0 else min(1.0, travelled / seg_m)
             lat = lat0 + (lat1 - lat0) * frac
             lon = lon0 + (lon1 - lon0) * frac
-            await sim.set(lat, lon)
-            if on_update is not None:
-                on_update(lat, lon)
+            if motion is not None:
+                dlat, dlon = motion.jitter_offset(lat, dt)
+                rlat, rlon = lat + dlat, lon + dlon
+                await sim.set(rlat, rlon)
+                if on_update is not None:
+                    on_update(rlat, rlon, seg_bearing[i], spd)
+            else:
+                rlat, rlon = lat, lon
+                await sim.set(lat, lon)
+                if on_update is not None:
+                    on_update(lat, lon)
             if show_progress:
                 _print_route_progress(
-                    i, n_segs, name1, lat, lon, done_m + seg_m * frac,
+                    i, n_segs, name1, rlat, rlon, done_m + seg_m * frac,
                     total_m, spd,
                 )
             if frac >= 1.0:
@@ -728,6 +957,7 @@ async def drive_route(
 async def drive_repeated(
     sim, points: list[tuple[str, float, float]], speed_mps: float, repeat: str,
     *, on_update=None, show_progress: bool = True, get_speed=None,
+    motion: Optional[MotionState] = None,
 ) -> None:
     """Drive `points` according to `repeat`.
 
@@ -738,22 +968,24 @@ async def drive_repeated(
               (A->B->C->D->E->D->C->B->A->B->...), reversing at each end.
 
     `loop` and `bounce` never return on their own; the caller stops them by
-    cancelling this coroutine. `on_update` / `show_progress` are forwarded to
-    `drive_route`.
+    cancelling this coroutine. `on_update` / `show_progress` / `motion` are
+    forwarded to `drive_route`. In realistic mode only a single `once` pass
+    rolls to a stop at the end; loop/bounce keep the velocity across passes
+    (`stop_at_end=False`) so motion stays continuous between laps.
     """
     opts = {"on_update": on_update, "show_progress": show_progress,
-            "get_speed": get_speed}
+            "get_speed": get_speed, "motion": motion}
     if repeat == "loop":
         cycle = points + [points[0]]  # close the lap by driving last->first
         while True:
-            await drive_route(sim, cycle, speed_mps, **opts)
+            await drive_route(sim, cycle, speed_mps, stop_at_end=False, **opts)
     elif repeat == "bounce":
         reverse = list(reversed(points))
         while True:
-            await drive_route(sim, points, speed_mps, **opts)
-            await drive_route(sim, reverse, speed_mps, **opts)
+            await drive_route(sim, points, speed_mps, stop_at_end=False, **opts)
+            await drive_route(sim, reverse, speed_mps, stop_at_end=False, **opts)
     else:  # once
-        await drive_route(sim, points, speed_mps, **opts)
+        await drive_route(sim, points, speed_mps, stop_at_end=True, **opts)
 
 
 def cmd_list(_args: argparse.Namespace) -> int:
@@ -981,10 +1213,14 @@ async def cmd_route(args: argparse.Namespace) -> int:
         repeat, ""
     )
     per = " per pass" if repeat != "once" else ""
+    motion = MotionState() if args.realistic else None
     print()
     print(f"  route:  {route_label}")
     print(f"  speed:  {speed_mps / MPH_TO_MPS:.1f} mph{mode_note}")
     print(f"  length: {pass_m / 1609.344:.2f} mi  (~{eta_s}s{per})")
+    if motion is not None:
+        print("  motion: natural (variable speed, accel/braking, "
+              "corner slowdown, GPS jitter)")
     print()
     print("  press Ctrl-C to clear and exit")
     print()
@@ -1010,7 +1246,7 @@ async def cmd_route(args: argparse.Namespace) -> int:
                     pass
 
             run_task = asyncio.create_task(
-                drive_repeated(sim, points, speed_mps, repeat)
+                drive_repeated(sim, points, speed_mps, repeat, motion=motion)
             )
             stop_task = asyncio.create_task(stop.wait())
             try:
@@ -1149,7 +1385,8 @@ async def _menu_prompt(locations: dict) -> Optional[dict]:
         print(f"  {ANSI['dim']}...or a coordinate pair: "
               f"47.490308, -122.205647{ANSI['reset']}")
         print(f"  {ANSI['dim']}...or a route to drive: "
-              f"kent > seattle > redmond @ 30 [loop|bounce]{ANSI['reset']}")
+              f"kent > seattle > redmond @ 30 [loop|bounce] [natural]"
+              f"{ANSI['reset']}")
         print()
         try:
             raw = await asyncio.get_event_loop().run_in_executor(
@@ -1171,12 +1408,13 @@ async def _menu_prompt(locations: dict) -> Optional[dict]:
             continue
         if ">" in choice:
             try:
-                points, speed, repeat = parse_route_line(choice, locations)
+                points, speed, repeat, realistic = parse_route_line(
+                    choice, locations)
             except ValueError as e:
                 print(f"  {ANSI['yellow']}{e}{ANSI['reset']}")
                 continue
             return {"kind": "route", "points": points, "speed": speed,
-                    "repeat": repeat}
+                    "repeat": repeat, "realistic": realistic}
         try:
             coords = parse_coords(choice)
         except ValueError as e:
@@ -1323,19 +1561,23 @@ async def _interactive_session(
 
 async def _interactive_route(
     iphone: dict, points: list[tuple[str, float, float]], speed_mps: float,
-    repeat: str = "once",
+    repeat: str = "once", realistic: bool = False,
 ) -> bool:
     """Drive a route in the UI, hold at the end, clear on key/Ctrl-C.
 
     Returns True to quit the whole UI (Ctrl-C), False to return to the menu.
     For a single pass, any key after arrival returns to the menu. For `loop`
     or `bounce` the route runs until Ctrl-C, which quits the UI (as does
-    Ctrl-C while a single pass is still moving).
+    Ctrl-C while a single pass is still moving). `realistic` adds human-like
+    acceleration/cornering and GPS jitter (see `MotionState`).
     """
     route_label = " -> ".join(p[0] for p in points)
     pass_m = route_pass_m(points, repeat)
     eta_s = int(pass_m / speed_mps) if speed_mps > 0 else 0
     mode_note = {"loop": ", looping", "bounce": ", bouncing"}.get(repeat, "")
+    if realistic:
+        mode_note += ", natural"
+    motion = MotionState() if realistic else None
 
     print()
     print(f"{ANSI['bold']}→ driving:{ANSI['reset']} {route_label}")
@@ -1360,7 +1602,7 @@ async def _interactive_route(
             })
             try:
                 if repeat == "once":
-                    await drive_route(sim, points, speed_mps)
+                    await drive_route(sim, points, speed_mps, motion=motion)
                     print(f"\n  {ANSI['green']}arrived at {points[-1][0]}"
                           f"{ANSI['reset']}")
                     print(f"  {ANSI['dim']}press any key to clear and return "
@@ -1371,7 +1613,8 @@ async def _interactive_route(
                     print(f"  {ANSI['dim']}Ctrl-C to clear and quit"
                           f"{ANSI['reset']}")
                     # Runs until Ctrl-C raises KeyboardInterrupt here.
-                    await drive_repeated(sim, points, speed_mps, repeat)
+                    await drive_repeated(sim, points, speed_mps, repeat,
+                                         motion=motion)
             finally:
                 print(f"  {ANSI['dim']}clearing...{ANSI['reset']}")
                 try:
@@ -1421,7 +1664,7 @@ async def cmd_ui(args: argparse.Namespace) -> int:
                 if choice["kind"] == "route":
                     done = await _interactive_route(
                         iphone, choice["points"], choice["speed"],
-                        choice["repeat"]
+                        choice["repeat"], choice.get("realistic", False)
                     )
                 else:
                     done = await _interactive_session(
@@ -1575,6 +1818,9 @@ MAP_HTML = """<!DOCTYPE html>
     </select>
   </div>
   <div class="row">
+    <label title="human-like speed, acceleration, cornering, and GPS jitter"><input type="checkbox" id="realistic"> natural motion</label>
+  </div>
+  <div class="row">
     <span id="stops" class="muted">stops: 0</span>
     <button id="undo">Undo</button>
     <button id="clearBtn">Clear</button>
@@ -1621,20 +1867,33 @@ MAP_HTML = """<!DOCTYPE html>
   function glyphEl() { const e = device.getElement(); return e ? e.querySelector('.car') : null; }
   let carHeading = 0, youKind = 'stand', youFace = 'R';
   const MOVE_MIN_M = 1, DRIVE_MIN_M = 4;   // per ~1s poll: < move = standing, >= drive = car, else walking
+  const STAND_MS = 0.5, DRIVE_MS = 2.5;    // realistic mode: m/s thresholds for standing / walking / driving
   function applyGlyph() {                   // car rotates to heading; walker flips to face travel; stand upright
     const el = glyphEl(); if (!el) return;
     el.style.transform = (youKind === 'car') ? ('rotate(' + carHeading + 'deg)')
                        : (youKind === 'walk' && youFace === 'L') ? 'scaleX(-1)' : 'none';
   }
   function setKind(kind) { if (kind !== youKind) { youKind = kind; device.setIcon(ICONS[kind]); } applyGlyph(); }
-  function updateMarker(np) {               // pick standing/walking/driving from movement since last fix
-    if (lastCarPos) {
+  function turnTo(b) { carHeading += ((b - carHeading) % 360 + 540) % 360 - 180; }  // turn the short way (no wild spin)
+  function updateMarker(np, speed, course) {  // pick standing/walking/driving + heading
+    if (typeof speed === 'number' && typeof course === 'number') {
+      // realistic drive: the server sends the clean speed/heading, so GPS
+      // jitter in the position doesn't make the marker spin or flicker kind.
+      if (speed < STAND_MS) { setKind('stand'); }   // stopped -> standing; keep last heading
+      else {
+        turnTo(course);
+        youFace = (course > 180) ? 'L' : 'R';        // heading west -> mirror the walker to face left
+        setKind(speed >= DRIVE_MS ? 'car' : 'walk');
+      }
+      lastCarPos = np;
+      return;
+    }
+    if (lastCarPos) {                         // exact drive: infer from movement since last fix
       const d = haversineM(lastCarPos, np);
       if (d < MOVE_MIN_M) { setKind('stand'); }   // not moving -> standing; keep last heading
       else {
-        const b = bearing(lastCarPos, np);
-        carHeading += ((b - carHeading) % 360 + 540) % 360 - 180;   // turn the short way (no wild spin)
-        youFace = (b > 180) ? 'L' : 'R';          // heading west -> mirror the walker to face left
+        turnTo(bearing(lastCarPos, np));
+        youFace = (bearing(lastCarPos, np) > 180) ? 'L' : 'R';
         setKind(d >= DRIVE_MIN_M ? 'car' : 'walk');
       }
     }
@@ -1865,7 +2124,8 @@ MAP_HTML = """<!DOCTYPE html>
         await post('/route', {
           points: stops.map(function (s) { return [s.lat, s.lon]; }),
           speed: curSpeed() || 30,
-          repeat: document.getElementById('repeat').value
+          repeat: document.getElementById('repeat').value,
+          realistic: document.getElementById('realistic').checked
         });
         updateTransport(true, false);     // optimistic; poller reconciles
       } catch (e) { show('error: ' + e.message, 'err'); }
@@ -1960,7 +2220,7 @@ MAP_HTML = """<!DOCTYPE html>
       updateTransport(st.driving, !!st.paused);
       if (st.driving) {
         if (!wasDriving) lastCarPos = null;       // fresh heading at drive start
-        updateMarker({ lat: st.lat, lon: st.lon });   // standing / walking / driving + heading
+        updateMarker({ lat: st.lat, lon: st.lon }, st.speed, st.course);   // standing / walking / driving + heading
         device.setLatLng([st.lat, st.lon]);
         if (document.getElementById('follow').checked) map.panTo([st.lat, st.lon]);
         show((st.paused ? 'paused: ' : 'driving: ') + fmt(st.lat, st.lon),
@@ -1986,7 +2246,7 @@ class _MapRequestHandler(BaseHTTPRequestHandler):
       server.loop        - the asyncio loop running LocationSimulation
       server.current     - {lat, lon, active, driving} for GET /state
       server.apply_set   - coroutine fn (lat, lon) -> teleport
-      server.start_route - coroutine fn (points, speed_mps, repeat) -> drive
+      server.start_route - coroutine fn (points, speed_mps, repeat, realistic) -> drive
       server.stop_drive  - coroutine fn () -> halt any active drive
     """
 
@@ -2067,6 +2327,7 @@ class _MapRequestHandler(BaseHTTPRequestHandler):
             pts = [(float(a), float(b)) for a, b in p["points"]]
             speed = float(p.get("speed", DEFAULT_ROUTE_SPEED_MPH))
             repeat = str(p.get("repeat", "once"))
+            realistic = bool(p.get("realistic", False))
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             self._send(400, json.dumps(
                 {"error": "expected {points:[[lat,lon],...], speed, repeat}"}))
@@ -2085,7 +2346,8 @@ class _MapRequestHandler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": "repeat must be once|loop|bounce"}))
             return
         try:
-            self._run(self.server.start_route(pts, speed * MPH_TO_MPS, repeat))
+            self._run(self.server.start_route(
+                pts, speed * MPH_TO_MPS, repeat, realistic))
         except Exception as e:
             self._send(500, json.dumps({"error": str(e)}))
             return
@@ -2221,9 +2483,14 @@ async def cmd_map(args: argparse.Namespace) -> int:
             # While paused the drive holds position (get_speed returns 0).
             server.paused = False
 
-            def set_current(lat, lon, *, active=True, driving=False) -> None:
+            def set_current(lat, lon, *, active=True, driving=False,
+                            course=None, speed=None) -> None:
+                # course (deg) / speed (m/s) are only set during a realistic
+                # drive; the page uses them for the marker heading/kind and
+                # falls back to position deltas when they're absent.
                 server.current = {"lat": lat, "lon": lon,
-                                  "active": active, "driving": driving}
+                                  "active": active, "driving": driving,
+                                  "course": course, "speed": speed}
 
             async def cancel_drive() -> None:
                 task = server.drive_task
@@ -2254,15 +2521,17 @@ async def cmd_map(args: argparse.Namespace) -> int:
                     record_state(f"{lat}, {lon}", lat, lon)
                     _progress(f"set {lat:.6f}, {lon:.6f}")
 
-            async def start_route(pts, speed_mps, repeat) -> None:
+            async def start_route(pts, speed_mps, repeat, realistic=False) -> None:
                 named = [(f"{la}, {lo}", la, lo) for la, lo in pts]
+                motion = MotionState() if realistic else None
                 async with control:
                     await cancel_drive()
                     server.speed_mps = speed_mps  # seed live speed for this run
                     server.paused = False
 
-                    def on_update(la, lo):
-                        set_current(la, lo, active=True, driving=True)
+                    def on_update(la, lo, course=None, speed=None):
+                        set_current(la, lo, active=True, driving=True,
+                                    course=course, speed=speed)
 
                     async def runner():
                         await drive_repeated(
@@ -2270,6 +2539,7 @@ async def cmd_map(args: argparse.Namespace) -> int:
                             on_update=on_update, show_progress=False,
                             get_speed=lambda: 0.0 if server.paused
                             else server.speed_mps,
+                            motion=motion,
                         )
                         # `once` finished: hold at the final stop.
                         server.paused = False
@@ -2281,7 +2551,8 @@ async def cmd_map(args: argparse.Namespace) -> int:
                     label = " -> ".join(p[0] for p in named)
                     record_state(label, named[0][1], named[0][2])
                     _progress(f"driving {len(named)} stops @ "
-                              f"{speed_mps / MPH_TO_MPS:.0f} mph ({repeat})")
+                              f"{speed_mps / MPH_TO_MPS:.0f} mph ({repeat}"
+                              f"{', natural' if realistic else ''})")
 
             async def stop_drive() -> None:
                 async with control:
@@ -2379,6 +2650,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  gpsspoof set 47.490308 -122.205647   # spoof to raw coordinates\n"
             "  gpsspoof route kent seattle redmond --speed 30   # drive a route\n"
             "  gpsspoof route kent seattle redmond --bounce     # there-and-back\n"
+            "  gpsspoof route kent seattle redmond --realistic  # human-like motion + jitter\n"
             "  gpsspoof route kent seattle --save commute       # save + drive\n"
             "  gpsspoof routes                   # list saved routes\n"
             "  gpsspoof route --load commute --loop   # drive a saved route\n"
@@ -2451,6 +2723,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_route.add_argument(
         "--delete", metavar="NAME",
         help="delete the saved route NAME and exit (no device needed)",
+    )
+    p_route.add_argument(
+        "--realistic", "--natural",
+        dest="realistic", action="store_true",
+        help="drive like a human: variable speed, real acceleration/braking, "
+             "slowing for corners, and drifting GPS jitter (simulates a "
+             "varying accuracy). Off by default (exact, constant-speed motion).",
     )
     p_route.set_defaults(repeat=None)
     repeat_mode = p_route.add_mutually_exclusive_group()

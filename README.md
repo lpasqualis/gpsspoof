@@ -4,7 +4,9 @@ A small macOS tool that spoofs the GPS location of a USB-connected iPhone
 using [`pymobiledevice3`](https://github.com/doronz88/pymobiledevice3).
 Set a fixed point, **drive a route** through waypoints at a chosen speed
 (once / loop / bounce), or open a **clickable browser map** to place and
-drive routes live. Pure Python — the map UI is a small page served on
+drive routes live. An optional **realistic** mode drives like a human —
+variable speed, real acceleration and braking, slowing for corners, and
+drifting GPS jitter. Pure Python — the map UI is a small page served on
 localhost, no native GUI. Targets iOS 17 and newer (verified on iOS 26).
 
 ![The gpsspoof map: a multi-stop route with the car marker driving it, live distance/ETA, speed, and play/pause/stop controls](assets/mapview.png)
@@ -176,6 +178,7 @@ gpsspoof list                     # list named locations
 gpsspoof set seattle              # one-shot foreground spoof; Ctrl-C clears
 gpsspoof set 47.490308 -122.205647   # spoof to raw coordinates
 gpsspoof route kent seattle redmond --speed 30   # drive a route at 30 mph
+gpsspoof route kent seattle redmond --realistic  # human-like motion + GPS jitter
 gpsspoof status                   # show what's running (from any shell)
 gpsspoof clear                    # explicitly clear the device
 
@@ -213,7 +216,7 @@ Select a location:
   [12]  vegas      36.1699, -115.1398
   [ q]  quit
   ...or a coordinate pair: 47.490308, -122.205647
-  ...or a route to drive: kent > seattle > redmond @ 30
+  ...or a route to drive: kent > seattle > redmond @ 30 [loop|bounce] [natural]
 
 > 1
 → engaging: bellevue (47.6101, -122.2015)
@@ -245,13 +248,15 @@ Besides the numbered entries, you can type at the `>` prompt:
 - a raw coordinate pair (e.g. `47.490308, -122.205647`) to spoof an
   arbitrary point that isn't in the list; or
 - a route to drive — waypoints separated by `>` (or `->`) with an
-  optional trailing `@ speed` in mph and an optional `loop` or `bounce`
-  keyword, e.g. `kent > seattle > redmond @ 30`,
+  optional trailing `@ speed` in mph, an optional `loop` or `bounce`
+  keyword, and an optional `natural` keyword for realistic motion, e.g.
+  `kent > seattle > redmond @ 30`,
   `kent > seattle > redmond @ 30 bounce`, or
-  `47.5,-122.2 > 47.49,-122.2 @ 25 loop`. Each waypoint may be a name or
-  a `lat,lon` pair. A single pass waits at the final waypoint for a
-  keypress; `loop`/`bounce` run until Ctrl-C (Ctrl-C while moving quits
-  the UI). See [`gpsspoof route`](#gpsspoof-route-waypoints) for details.
+  `47.5,-122.2 > 47.49,-122.2 @ 25 loop natural`. Each waypoint may be a
+  name or a `lat,lon` pair. A single pass waits at the final waypoint for a
+  keypress; `loop`/`bounce` run until Ctrl-C (Ctrl-C while moving quits the
+  UI). `natural` adds the human-like motion + GPS jitter described under
+  [`route --realistic`](#gpsspoof-route-waypoints).
 
 ### `gpsspoof map`
 
@@ -297,6 +302,10 @@ The page has a small control panel with two modes:
   change the speed. Changing the speed **while a drive is running** takes
   effect immediately — no need to stop and restart. Tick **follow** to
   keep the map centered on the dot as it drives (toggle off to pan freely).
+  Tick **natural motion** before pressing Drive for the human-like profile
+  described under [`route --realistic`](#gpsspoof-route-waypoints) — variable
+  speed, real acceleration/braking, slowing for corners, and drifting GPS
+  jitter; leave it off for exact, constant-speed movement.
 
   Editing the stops:
 
@@ -429,6 +438,35 @@ Notes:
   `sudo gpsspoof route --speed 50 -- -33.8688,151.2093 -37.8136,144.9631`.
 - `gpsspoof status` reports the route as its `start -> ... -> end` label.
 
+**Realistic motion (`--realistic`).** By default a route is driven exactly:
+the dot holds the commanded speed and tracks the straight segments precisely.
+Add `--realistic` (alias `--natural`) to make it drive like a human instead:
+
+- **Variable speed.** The commanded speed becomes a *cruise target* that
+  drifts within a band (about ±8%), so it never sits perfectly flat.
+- **Real acceleration and braking.** Speed changes are rate-limited (it
+  pulls away from a stop and slows down gradually, with some variation in
+  how hard), rather than snapping to the new value.
+- **Slowing for corners.** It looks ahead and brakes before a turn — gently
+  for a slight bend, hard for a hairpin — then accelerates back out. A single
+  pass also rolls to a stop on arrival; `loop`/`bounce` keep rolling.
+- **GPS jitter.** The reported fix carries a small, slowly-drifting scatter
+  (a few meters, wandering as if the accuracy were changing), so the dot
+  wobbles like a real one — even while stopped.
+
+```bash
+sudo gpsspoof route kent seattle redmond --speed 35 --realistic
+sudo gpsspoof route kent seattle redmond --speed 35 --realistic --loop
+```
+
+About **GPS accuracy**: the device protocol only accepts a latitude and
+longitude — iOS generates the `horizontalAccuracy` value apps read, and there
+is no way to set it. So the accuracy *number* can't be spoofed, but the
+jitter above reproduces its *effect* (the dot scattering more or less over
+time). As a bonus, iOS derives the reported speed and heading from successive
+fixes, so the acceleration and cornering make those readings look natural too.
+Realistic mode is a per-drive choice and is not stored with saved routes.
+
 **Saving and reusing routes.** A route (its stops, speed, and repeat
 mode) can be saved by name to `~/.config/iphone-spoof/routes.json` and
 replayed later — from the CLI or from the [`map`](#gpsspoof-map) page,
@@ -443,8 +481,8 @@ gpsspoof routes                                                     # list saved
 ```
 
 `--save` stores the route before driving; `--load` replays it (any
-`--speed` / `--loop` / `--bounce` you also pass override what was saved).
-See [`gpsspoof routes`](#gpsspoof-routes) to list them.
+`--speed` / `--loop` / `--bounce` / `--realistic` you also pass override what
+was saved). See [`gpsspoof routes`](#gpsspoof-routes) to list them.
 
 ### `gpsspoof routes`
 
