@@ -734,8 +734,10 @@ class MotionState:
 
     Created once per drive and threaded through `drive_route` /
     `drive_repeated`, so the current speed and the (correlated) GPS jitter
-    persist across segments and repeated passes instead of resetting. All the
-    tunables live in the module-level REALISM_* constants.
+    persist across segments and repeated passes instead of resetting. The
+    key tunables (speed_variation, accel_max, decel_max, jitter_m,
+    jitter_max_m) are constructor args defaulting to the module-level REALISM_*
+    constants; the map UI overrides them per drive, the CLI/`ui` use defaults.
 
     The four behaviors:
       * cruise_speed   - the commanded speed becomes a target that wanders
@@ -750,12 +752,25 @@ class MotionState:
         scatter, which is how we simulate a variable GPS-accuracy reading.
     """
 
-    def __init__(self, rng: Optional[random.Random] = None) -> None:
+    def __init__(self, *, speed_variation: float = REALISM_SPEED_VARIATION,
+                 accel_max: float = REALISM_ACCEL_MAX,
+                 decel_max: float = REALISM_DECEL_MAX,
+                 jitter_m: float = REALISM_JITTER_M,
+                 jitter_max_m: float = REALISM_JITTER_MAX_M,
+                 rng: Optional[random.Random] = None) -> None:
+        # Per-drive tunables (defaults = the module REALISM_* constants). The map
+        # UI overrides these per drive; the CLI/ui use the defaults. Clamped to
+        # sane ranges so a stray value can't divide by zero or stall the drive.
+        self.speed_variation = max(0.0, min(0.5, speed_variation))
+        self.accel_max = max(0.1, accel_max)
+        self.decel_max = max(0.1, decel_max)
+        self.jitter_m = max(0.0, jitter_m)
+        self.jitter_max_m = max(self.jitter_m, jitter_max_m)
         self.v = 0.0                  # current speed, m/s (starts from rest)
         self.cruise_mult = 1.0        # wandering multiplier on the commanded speed
         self.jx = 0.0                 # current east jitter offset, meters
         self.jy = 0.0                 # current north jitter offset, meters
-        self.sigma = REALISM_JITTER_M  # current scatter radius, meters
+        self.sigma = self.jitter_m    # current scatter radius, meters
         self.rng = rng or random.Random()
 
     def _ou_step(self, value: float, mean: float, tau: float,
@@ -778,8 +793,8 @@ class MotionState:
             return 0.0       # paused / idle: target a full stop
         self.cruise_mult = self._ou_step(
             self.cruise_mult, 1.0, REALISM_SPEED_TAU_S,
-            REALISM_SPEED_VARIATION, dt)
-        lo, hi = 1.0 - 2.5 * REALISM_SPEED_VARIATION, 1.0 + 2.5 * REALISM_SPEED_VARIATION
+            self.speed_variation, dt)
+        lo, hi = 1.0 - 2.5 * self.speed_variation, 1.0 + 2.5 * self.speed_variation
         self.cruise_mult = min(hi, max(lo, self.cruise_mult))
         return commanded * self.cruise_mult
 
@@ -799,7 +814,7 @@ class MotionState:
             return 0.0
         last = len(cum) - 1
         s_abs = cum[seg_idx] + travelled
-        decel = REALISM_DECEL_MAX
+        decel = self.decel_max
         horizon = cruise * cruise / (2.0 * decel) + 5.0
         v_target = cruise
         for k in range(seg_idx + 1, len(cum)):
@@ -823,7 +838,7 @@ class MotionState:
         """Move the current speed toward `v_target`, accel/decel-limited."""
         if dt <= 0:
             return self.v
-        a = REALISM_ACCEL_MAX if v_target > self.v else REALISM_DECEL_MAX
+        a = self.accel_max if v_target > self.v else self.decel_max
         a *= 1.0 + self.rng.uniform(-REALISM_RATE_JITTER, REALISM_RATE_JITTER)
         dv = max(0.0, a) * dt
         if v_target > self.v:
@@ -841,16 +856,38 @@ class MotionState:
         their own mean-reverting walks at that radius. Continues even at a
         standstill, so the dot wanders at rest like a real one.
         """
-        mid = (REALISM_JITTER_M + REALISM_JITTER_MAX_M) / 2.0
-        amp = (REALISM_JITTER_MAX_M - REALISM_JITTER_M) / 2.0
-        self.sigma = min(REALISM_JITTER_MAX_M, max(
-            REALISM_JITTER_M,
+        mid = (self.jitter_m + self.jitter_max_m) / 2.0
+        amp = (self.jitter_max_m - self.jitter_m) / 2.0
+        self.sigma = min(self.jitter_max_m, max(
+            self.jitter_m,
             self._ou_step(self.sigma, mid, REALISM_ACCURACY_TAU_S, amp, dt)))
         self.jx = self._ou_step(self.jx, 0.0, REALISM_JITTER_TAU_S, self.sigma, dt)
         self.jy = self._ou_step(self.jy, 0.0, REALISM_JITTER_TAU_S, self.sigma, dt)
         dlat = self.jy / 111320.0
         dlon = self.jx / (111320.0 * math.cos(math.radians(lat)) or 1e-6)
         return dlat, dlon
+
+
+def _realism_params_from_json(rp: dict) -> dict:
+    """Coerce a map-supplied realism object into `MotionState` kwargs.
+
+    All fields are optional; anything missing or unparseable falls back to the
+    REALISM_* default, and `MotionState` clamps the result to sane ranges. The
+    map sends canonical units: `speed_variation` as a fraction (0.08 = ±8%),
+    `accel_max`/`decel_max` in m/s², `jitter_m`/`jitter_max_m` in meters.
+    """
+    def num(key: str, default: float) -> float:
+        try:
+            return float(rp[key])
+        except (KeyError, TypeError, ValueError):
+            return default
+    return {
+        "speed_variation": num("speed_variation", REALISM_SPEED_VARIATION),
+        "accel_max": num("accel_max", REALISM_ACCEL_MAX),
+        "decel_max": num("decel_max", REALISM_DECEL_MAX),
+        "jitter_m": num("jitter_m", REALISM_JITTER_M),
+        "jitter_max_m": num("jitter_max_m", REALISM_JITTER_MAX_M),
+    }
 
 
 async def drive_route(
@@ -1820,12 +1857,23 @@ MAP_HTML = """<!DOCTYPE html>
   <div class="row">
     <label title="human-like speed, acceleration, cornering, and GPS jitter"><input type="checkbox" id="realistic"> natural motion</label>
   </div>
+  <div id="realismOpts" style="display:none">
+    <div class="row">
+      vary &plusmn;<input id="rv_var" type="number" value="8" min="0" max="50" step="1" style="width:3em">%
+      &nbsp;jitter <input id="rv_jmin" type="number" value="2.5" min="0" step="0.5" style="width:3em">&ndash;<input id="rv_jmax" type="number" value="8" min="0" step="0.5" style="width:3em">m
+    </div>
+    <div class="row">
+      accel <input id="rv_acc" type="number" value="0.2" min="0.02" step="0.05" style="width:3em">g
+      &nbsp;brake <input id="rv_dec" type="number" value="0.3" min="0.02" step="0.05" style="width:3em">g
+    </div>
+  </div>
   <div class="row">
     <span id="stops" class="muted">stops: 0</span>
     <button id="undo">Undo</button>
     <button id="clearBtn">Clear</button>
   </div>
   <div class="row" id="routeInfo" style="font-weight:600; color:#1462ff">add 2+ stops</div>
+  <div class="row" id="liveHud" style="display:none; font-weight:700; color:#0a7d2c">&nbsp;</div>
   <div class="row hint">click map: add at end &middot; click a stop: select (Esc clears)</div>
   <div class="row hint">selected &rarr; click map inserts before it &middot; Del removes it</div>
   <div class="row hint">drag: move &middot; right-click: delete &middot; click line: insert</div>
@@ -1915,6 +1963,10 @@ MAP_HTML = """<!DOCTYPE html>
   let driving = false;
   let paused = false;
   let lastCarPos = null;
+  let lastSpeed = null, lastSpeedT = 0, accelG = 0;   // for the live speed/accel HUD
+  const G_MS2 = 9.80665;
+  const liveHud = document.getElementById('liveHud');
+  const realismOpts = document.getElementById('realismOpts');
 
   function fmt(lat, lon) { return lat.toFixed(6) + ', ' + lon.toFixed(6); }
   function show(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
@@ -1946,6 +1998,29 @@ MAP_HTML = """<!DOCTYPE html>
     return h + 'h ' + (mm < 10 ? '0' : '') + mm + 'm';
   }
   function curSpeed() { return Number(document.getElementById('speed').value) || 0; }
+  function realismParams() {        // natural-mode knobs, sent to the server in canonical units
+    function num(id, d) { const v = Number(document.getElementById(id).value); return isFinite(v) ? v : d; }
+    return {
+      speed_variation: num('rv_var', 8) / 100,    // percent -> fraction
+      accel_max: num('rv_acc', 0.2) * G_MS2,      // g -> m/s^2
+      decel_max: num('rv_dec', 0.3) * G_MS2,      // g -> m/s^2
+      jitter_m: num('rv_jmin', 2.5),
+      jitter_max_m: num('rv_jmax', 8)
+    };
+  }
+  function updateHud(speed, wasDriving) {   // live speed (mph) + acceleration (g) during a natural drive
+    if (typeof speed !== 'number') { liveHud.style.display = 'none'; lastSpeed = null; return; }
+    const now = performance.now();
+    if (!wasDriving) { lastSpeed = null; accelG = 0; }   // fresh readout at drive start
+    if (lastSpeed !== null && now > lastSpeedT) {
+      const a = (speed - lastSpeed) / ((now - lastSpeedT) / 1000);   // m/s^2 over the poll gap
+      accelG = accelG * 0.5 + (a / G_MS2) * 0.5;                      // light smoothing
+    }
+    lastSpeed = speed; lastSpeedT = now;
+    const mph = speed / 0.44704;
+    liveHud.textContent = mph.toFixed(0) + ' mph  ·  ' + (accelG >= 0 ? '+' : '') + accelG.toFixed(2) + ' g';
+    liveHud.style.display = '';
+  }
   function updateInfo() {
     const el = document.getElementById('routeInfo');
     if (stops.length < 2) { el.textContent = 'add 2+ stops'; return; }
@@ -2077,6 +2152,9 @@ MAP_HTML = """<!DOCTYPE html>
   document.getElementById('follow').addEventListener('change', function () {
     if (this.checked) map.panTo(device.getLatLng());   // center now when enabled
   });
+  document.getElementById('realistic').addEventListener('change', function () {
+    realismOpts.style.display = this.checked ? '' : 'none';   // reveal the knobs when on
+  });
   let speedTimer = null;
   document.getElementById('speed').addEventListener('input', function () {
     updateInfo();                                   // instant length/time readout
@@ -2125,7 +2203,8 @@ MAP_HTML = """<!DOCTYPE html>
           points: stops.map(function (s) { return [s.lat, s.lon]; }),
           speed: curSpeed() || 30,
           repeat: document.getElementById('repeat').value,
-          realistic: document.getElementById('realistic').checked
+          realistic: document.getElementById('realistic').checked,
+          realism: realismParams()
         });
         updateTransport(true, false);     // optimistic; poller reconciles
       } catch (e) { show('error: ' + e.message, 'err'); }
@@ -2221,6 +2300,7 @@ MAP_HTML = """<!DOCTYPE html>
       if (st.driving) {
         if (!wasDriving) lastCarPos = null;       // fresh heading at drive start
         updateMarker({ lat: st.lat, lon: st.lon }, st.speed, st.course);   // standing / walking / driving + heading
+        updateHud(st.speed, wasDriving);          // live speed + acceleration (natural mode only)
         device.setLatLng([st.lat, st.lon]);
         if (document.getElementById('follow').checked) map.panTo([st.lat, st.lon]);
         show((st.paused ? 'paused: ' : 'driving: ') + fmt(st.lat, st.lon),
@@ -2228,6 +2308,7 @@ MAP_HTML = """<!DOCTYPE html>
       } else if (wasDriving) {                    // just stopped -> hold position, standing
         lastCarPos = { lat: st.lat, lon: st.lon };
         setKind('stand');
+        liveHud.style.display = 'none'; lastSpeed = null;   // clear the live readout
         device.setLatLng([st.lat, st.lon]);
         show('spoofing: ' + fmt(st.lat, st.lon), 'ok');
       }
@@ -2246,7 +2327,7 @@ class _MapRequestHandler(BaseHTTPRequestHandler):
       server.loop        - the asyncio loop running LocationSimulation
       server.current     - {lat, lon, active, driving} for GET /state
       server.apply_set   - coroutine fn (lat, lon) -> teleport
-      server.start_route - coroutine fn (points, speed_mps, repeat, realistic) -> drive
+      server.start_route - coroutine fn (points, speed_mps, repeat, realistic, realism) -> drive
       server.stop_drive  - coroutine fn () -> halt any active drive
     """
 
@@ -2328,6 +2409,8 @@ class _MapRequestHandler(BaseHTTPRequestHandler):
             speed = float(p.get("speed", DEFAULT_ROUTE_SPEED_MPH))
             repeat = str(p.get("repeat", "once"))
             realistic = bool(p.get("realistic", False))
+            realism = (_realism_params_from_json(p.get("realism") or {})
+                       if realistic else None)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             self._send(400, json.dumps(
                 {"error": "expected {points:[[lat,lon],...], speed, repeat}"}))
@@ -2347,7 +2430,7 @@ class _MapRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             self._run(self.server.start_route(
-                pts, speed * MPH_TO_MPS, repeat, realistic))
+                pts, speed * MPH_TO_MPS, repeat, realistic, realism))
         except Exception as e:
             self._send(500, json.dumps({"error": str(e)}))
             return
@@ -2521,9 +2604,10 @@ async def cmd_map(args: argparse.Namespace) -> int:
                     record_state(f"{lat}, {lon}", lat, lon)
                     _progress(f"set {lat:.6f}, {lon:.6f}")
 
-            async def start_route(pts, speed_mps, repeat, realistic=False) -> None:
+            async def start_route(pts, speed_mps, repeat, realistic=False,
+                                  realism=None) -> None:
                 named = [(f"{la}, {lo}", la, lo) for la, lo in pts]
-                motion = MotionState() if realistic else None
+                motion = MotionState(**(realism or {})) if realistic else None
                 async with control:
                     await cancel_drive()
                     server.speed_mps = speed_mps  # seed live speed for this run

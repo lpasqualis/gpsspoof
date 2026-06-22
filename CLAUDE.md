@@ -58,9 +58,16 @@ unlocked. When no device is attached, device commands fail fast with
   to a stop on `once` arrival via `stop_at_end`), and adds drifting GPS
   jitter. State persists across segments/passes so motion is continuous.
   The protocol sends only lat/lon — `horizontalAccuracy` isn't settable —
-  so jitter stands in for variable accuracy; tunables are the module-level
-  `REALISM_*` constants. In realistic mode `on_update`/`/state` also carry
-  the clean `course`+`speed` so the map marker doesn't spin from jitter.
+  so jitter stands in for variable accuracy. The key tunables
+  (speed_variation, accel_max, decel_max, jitter_m, jitter_max_m) are
+  `MotionState` constructor args defaulting to the module-level `REALISM_*`
+  constants; the map UI overrides them per drive (knobs revealed by the
+  checkbox, sent in the `/route` body, validated by
+  `_realism_params_from_json`), while `route --realistic`/`ui` use defaults.
+  In realistic mode `on_update`/`/state` also carry the clean `course`+`speed`
+  so the map marker doesn't spin from jitter and the page can show a live
+  speed/acceleration (g) HUD (acceleration is computed client-side from
+  successive speed samples).
 - Map server: `cmd_map` runs a stdlib `ThreadingHTTPServer` alongside the
   asyncio `LocationSimulation`; `_MapRequestHandler` bridges HTTP →
   asyncio via `run_coroutine_threadsafe`. The served page is the

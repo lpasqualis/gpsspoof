@@ -305,7 +305,18 @@ The page has a small control panel with two modes:
   Tick **natural motion** before pressing Drive for the human-like profile
   described under [`route --realistic`](#gpsspoof-route-waypoints) — variable
   speed, real acceleration/braking, slowing for corners, and drifting GPS
-  jitter; leave it off for exact, constant-speed movement.
+  jitter; leave it off for exact, constant-speed movement. Ticking it reveals
+  four knobs (the **speed** field stays the cruise target):
+    - **vary ±__%** — how far the cruise speed wanders above/below the target;
+    - **accel __ g** / **brake __ g** — the acceleration and braking limits;
+    - **jitter __–__ m** — the GPS scatter range (its low–high bounds; the
+      radius drifts within them, standing in for a varying accuracy).
+
+  While a natural drive runs, a live readout under the route info shows the
+  **current speed** (mph) and **current acceleration** in **g** (positive
+  speeding up, negative braking) — so you can watch it ramp, hold, slow for a
+  corner, and roll to a stop. These knobs are a map-only convenience; the CLI's
+  `--realistic` uses the built-in defaults.
 
   Editing the stops:
 
